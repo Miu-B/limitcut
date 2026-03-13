@@ -1,0 +1,16 @@
+# Build artifacts
+/target
+
+# Cargo lock is committed for binary crates (this is a binary crate)
+# !Cargo.lock
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
