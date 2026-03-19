@@ -20,6 +20,13 @@ use ffmpeg::{
 };
 use overlap::find_cut_point;
 
+/// Maximum seconds of black-hold before the auto-trim kicks in.
+///
+/// When the user requests a `--black-hold` longer than this, the excess is
+/// converted into a pre-input seek (`-ss`) so the output never starts with
+/// more than `MAX_BLACK_HOLD` seconds of black screen.
+const MAX_BLACK_HOLD: f64 = 4.0;
+
 fn main() {
     let args = Args::parse();
 
@@ -173,9 +180,26 @@ fn run(args: Args) -> anyhow::Result<()> {
         .into());
     }
 
-    // Total output duration ≈ pre cut point + full post-video length
+    // Auto-trim: if black_hold exceeds MAX_BLACK_HOLD, convert the excess
+    // into a pre-input seek so the output never starts with a long black
+    // screen. The effective_hold is capped at MAX_BLACK_HOLD, and the
+    // pre-video is seeked past the trimmed portion.
+    let (pre_seek, effective_hold) = if black_hold > MAX_BLACK_HOLD {
+        let excess = black_hold - MAX_BLACK_HOLD;
+        tracing::info!(
+            "Auto-trimming black hold: {:.1}s → {:.1}s (seeking {:.1}s into pre-video)",
+            black_hold,
+            MAX_BLACK_HOLD,
+            excess,
+        );
+        (excess, MAX_BLACK_HOLD)
+    } else {
+        (0.0, black_hold)
+    };
+
+    // Total output duration ≈ pre cut point (minus seek) + full post-video length
     let post_duration = get_duration(&bins.ffprobe, &args.post_video).unwrap_or(0.0);
-    let estimated_total = result.cut_point_secs + post_duration;
+    let estimated_total = (result.cut_point_secs - pre_seek) + post_duration;
 
     tracing::info!(
         "Output: {} (estimated {:.0}s)",
@@ -194,8 +218,9 @@ fn run(args: Args) -> anyhow::Result<()> {
         blurs: &args.blur,
         fadein,
         fadeout,
-        black_hold,
+        black_hold: effective_hold,
         title: args.title.as_deref(),
+        pre_seek_secs: pre_seek,
     };
 
     if args.dry_run {

@@ -36,6 +36,12 @@ pub struct ConcatParams<'a> {
     pub black_hold: f64,
     /// Title text displayed during black-hold + fade-in period. Lines separated by '/'.
     pub title: Option<&'a str>,
+    /// Seconds to seek into the pre-video before reading (0.0 = no seek).
+    ///
+    /// Used by the auto-trim feature: when `black_hold` exceeds
+    /// `MAX_BLACK_HOLD`, the excess is converted into a pre-input seek so
+    /// the output never starts with more than 4 seconds of black.
+    pub pre_seek_secs: f64,
 }
 
 /// Result returned after a successful concat operation.
@@ -273,9 +279,10 @@ fn escape_drawtext(text: &str) -> String {
 /// Build the ffmpeg `Command` for a two-input concat with always-on
 /// fade-in/fade-out and optional title overlay.
 ///
-/// Only two inputs are used: 0=pre (trimmed to cut point), 1=post (full).
-/// The black-hold and fade effects are achieved purely through filters —
-/// the pre-video is never seeked or further trimmed.
+/// Only two inputs are used: 0=pre (optionally seeked + trimmed to cut
+/// point), 1=post (full). When `pre_seek_secs > 0`, the pre-video input
+/// is seeked by that amount and `-t` is reduced accordingly so the stream
+/// still ends at the original cut point.
 ///
 /// This is shared by both the real encode path and `--dry-run`, so the
 /// printed command always matches what would actually be executed.
@@ -293,8 +300,14 @@ pub fn build_ffmpeg_command(params: &ConcatParams) -> Command {
     let mut cmd = Command::new(params.ffmpeg);
     cmd.args(["-hide_banner", "-y"]);
 
-    // Input 0: pre-video trimmed to the cut point
-    cmd.args(["-t", &format!("{:.6}", params.cut_point_secs)]);
+    // Input 0: pre-video, optionally seeked and trimmed to the cut point.
+    // When pre_seek_secs > 0, we seek into the pre-video and shorten -t
+    // so the stream still ends at the original cut point.
+    if params.pre_seek_secs > 0.0 {
+        cmd.args(["-ss", &format!("{:.6}", params.pre_seek_secs)]);
+    }
+    let pre_duration = params.cut_point_secs - params.pre_seek_secs;
+    cmd.args(["-t", &format!("{:.6}", pre_duration)]);
     cmd.arg("-i").arg(params.pre);
 
     // Input 1: full post-video
@@ -960,6 +973,7 @@ mod tests {
             fadeout: 1.0,
             black_hold: 0.0,
             title: None,
+            pre_seek_secs: 0.0,
         }
     }
 
@@ -994,9 +1008,55 @@ mod tests {
             .collect();
 
         // Still no -ss — black_hold is handled purely by the filter graph
+        // (the auto-trim logic lives in main.rs, not in the command builder)
         assert!(!args.contains(&"-ss".to_owned()));
         // -t is still the full cut point
         let t_pos = args.iter().position(|a| a == "-t").unwrap();
         assert_eq!(args[t_pos + 1], "25.000000");
+    }
+
+    #[test]
+    fn cmd_pre_seek_adds_ss_and_reduces_t() {
+        let enc = EncoderConfig::from_name("libx264");
+        let mut params = test_concat_params(25.0, &enc);
+        params.pre_seek_secs = 8.0; // e.g. black_hold=12 → trimmed to 4, seek=8
+        params.black_hold = 4.0;
+        let cmd = build_ffmpeg_command(&params);
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+
+        // -ss must be present before -i
+        let ss_pos = args.iter().position(|a| a == "-ss").unwrap();
+        assert_eq!(args[ss_pos + 1], "8.000000");
+
+        // -t must be cut_point - pre_seek = 25 - 8 = 17
+        let t_pos = args.iter().position(|a| a == "-t").unwrap();
+        assert_eq!(args[t_pos + 1], "17.000000");
+
+        // -ss comes before -t which comes before -i
+        let i_pos = args.iter().position(|a| a == "-i").unwrap();
+        assert!(ss_pos < t_pos);
+        assert!(t_pos < i_pos);
+    }
+
+    #[test]
+    fn cmd_pre_seek_zero_no_ss() {
+        let enc = EncoderConfig::from_name("libx264");
+        let mut params = test_concat_params(30.0, &enc);
+        params.pre_seek_secs = 0.0;
+        params.black_hold = 3.0; // under MAX_BLACK_HOLD, no seek
+        let cmd = build_ffmpeg_command(&params);
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+
+        // No -ss when pre_seek is 0
+        assert!(!args.contains(&"-ss".to_owned()));
+        // -t is full cut point
+        let t_pos = args.iter().position(|a| a == "-t").unwrap();
+        assert_eq!(args[t_pos + 1], "30.000000");
     }
 }
