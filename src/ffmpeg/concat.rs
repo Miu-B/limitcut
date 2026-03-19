@@ -20,10 +20,22 @@ pub struct ConcatParams<'a> {
     pub pre: &'a Path,
     pub post: &'a Path,
     pub output: &'a Path,
+    /// Duration of the pre-video up to the detected cut point (seconds).
+    /// The pre-video is trimmed to this length via `-t`.
     pub cut_point_secs: f64,
     pub estimated_total_secs: f64,
     pub encoder: &'a EncoderConfig,
     pub blurs: &'a [BlurRegion],
+    /// Fade-in duration in seconds (always applied, default 1.0).
+    pub fadein: f64,
+    /// Fade-out duration in seconds (always applied, default 1.0).
+    pub fadeout: f64,
+    /// Seconds of black screen before the fade-in begins (0.0 = none).
+    /// The pre-video is NOT trimmed — these seconds are blacked out by the
+    /// filter graph using `fade=t=in:st=black_hold:d=fadein`.
+    pub black_hold: f64,
+    /// Title text displayed during black-hold + fade-in period. Lines separated by '/'.
+    pub title: Option<&'a str>,
 }
 
 /// Result returned after a successful concat operation.
@@ -35,36 +47,78 @@ pub struct ConcatResult {
 
 // ── Filter graph construction ─────────────────────────────────────────────────
 
-/// Build the ffmpeg `-filter_complex` argument for a two-input concat with
-/// optional blur regions applied to the combined video stream.
+/// Parameters that control fade/title behaviour in the filter graph.
 ///
-/// Without blur regions:
-/// ```text
-/// [0:v][0:a][1:v][1:a]concat=n=2:v=1:a=1[v][a]
-/// ```
-///
-/// With N blur regions, the video stream `[cv]` is piped through N successive
-/// split→crop→boxblur→overlay chains before being labelled `[v]`:
-/// ```text
-/// [0:v][0:a][1:v][1:a]concat=n=2:v=1:a=1[cv][a];
-/// [cv]split[main0][blur0];[blur0]crop=W:H:X:Y,boxblur=10[blurred0];[main0][blurred0]overlay=X:Y[cv1];
-/// [cv1]split[main1][blur1];...overlay=X:Y[v]
-/// ```
-pub fn build_filter_complex(blurs: &[BlurRegion]) -> String {
-    if blurs.is_empty() {
-        return "[0:v][0:a][1:v][1:a]concat=n=2:v=1:a=1[v][a]".to_owned();
-    }
+/// Extracted from `ConcatParams` to keep `build_filter_complex` testable
+/// without needing file paths, encoder configs, etc.
+#[derive(Debug, Clone)]
+pub struct FadeParams<'a> {
+    /// Fade-in duration in seconds (always applied).
+    pub fadein: f64,
+    /// Fade-out duration in seconds (always applied).
+    pub fadeout: f64,
+    /// Seconds of the pre-video rendered as black before fade-in (0.0 = none).
+    pub black_hold: f64,
+    /// Title text displayed during black + fade-in period. Lines separated by '/'.
+    pub title: Option<&'a str>,
+    /// Total duration of the output video (needed for fade-out start time).
+    pub total_duration_secs: f64,
+}
 
-    // The concat produces [cv][a]; we'll chain blur transforms through [cv0], [cv1], …
-    let mut parts = vec!["[0:v][0:a][1:v][1:a]concat=n=2:v=1:a=1[cv0][a]".to_owned()];
+impl Default for FadeParams<'_> {
+    fn default() -> Self {
+        Self {
+            fadein: 1.0,
+            fadeout: 1.0,
+            black_hold: 0.0,
+            title: None,
+            total_duration_secs: 0.0,
+        }
+    }
+}
+
+/// Build the ffmpeg `-filter_complex` argument for a two-input concat with
+/// optional blur regions and always-on fade-in/fade-out effects.
+///
+/// The pipeline always uses 2 inputs (0=pre, 1=post) and the stages are:
+///
+/// 1. Concat: `[0:v][0:a][1:v][1:a]concat=n=2:v=1:a=1`
+/// 2. Blur regions (split→crop→boxblur→overlay chain)
+/// 3. Video fade-in (`fade=t=in:st=hold:d=fadein` — blacks out before `st`)
+///    and fade-out, plus audio silence/fade filters
+/// 4. Drawtext title overlay (visible during hold, fades out during fade-in)
+pub fn build_filter_complex(blurs: &[BlurRegion], fade: &FadeParams) -> String {
+    let hold = fade.black_hold;
+    let fadein = fade.fadein;
+    let fadeout = fade.fadeout;
+
+    // ── Stage 1: Concat ───────────────────────────────────────────────────
+
+    let has_title = fade.title.is_some();
+    // We always have fade, so we always need post-processing
+    let needs_post_processing = true;
+
+    let (concat_v_label, concat_a_label) = if needs_post_processing {
+        ("cv0".to_owned(), "araw".to_owned())
+    } else {
+        ("v".to_owned(), "a".to_owned())
+    };
+
+    let mut parts: Vec<String> = Vec::new();
+
+    // Always 2-input concat (no lavfi black source)
+    parts.push(format!(
+        "[0:v][0:a][1:v][1:a]concat=n=2:v=1:a=1[{concat_v}][{concat_a}]",
+        concat_v = concat_v_label,
+        concat_a = concat_a_label,
+    ));
+
+    // ── Stage 2: Blur regions ─────────────────────────────────────────────
+
+    let mut current_v = concat_v_label;
 
     for (i, blur) in blurs.iter().enumerate() {
-        let input_label = format!("cv{}", i);
-        let output_label = if i == blurs.len() - 1 {
-            "v".to_owned()
-        } else {
-            format!("cv{}", i + 1)
-        };
+        let output_label = format!("cv{}", i + 1);
         let main = format!("main{}", i);
         let blurred = format!("blurred{}", i);
 
@@ -72,7 +126,7 @@ pub fn build_filter_complex(blurs: &[BlurRegion]) -> String {
             "[{input}]split[{main}][blur{i}];\
              [blur{i}]crop={w}:{h}:{x}:{y},boxblur={r}[{blurred}];\
              [{main}][{blurred}]overlay={x}:{y}[{output}]",
-            input = input_label,
+            input = current_v,
             main = main,
             i = i,
             blurred = blurred,
@@ -83,19 +137,158 @@ pub fn build_filter_complex(blurs: &[BlurRegion]) -> String {
             r = BLUR_LUMA_RADIUS,
             output = output_label,
         ));
+
+        current_v = output_label;
+    }
+
+    // ── Stage 3: Video & audio fade ───────────────────────────────────────
+
+    let current_a = concat_a_label;
+
+    // Video fade-in: fade=t=in:st=hold:d=fadein
+    // This automatically blacks out all frames before st=hold.
+    let mut vfade_parts: Vec<String> = Vec::new();
+    let mut afade_parts: Vec<String> = Vec::new();
+
+    // Video fade-in
+    vfade_parts.push(format!(
+        "fade=t=in:st={st:.6}:d={d:.6}",
+        st = hold,
+        d = fadein,
+    ));
+
+    // Audio: silence [0, max(0, hold-fadein)], then afade from max(0, hold-fadein) for fadein
+    // so audio reaches full volume at t=hold (just as video starts fading in).
+    let audio_fade_start = (hold - fadein).max(0.0);
+    if audio_fade_start > 0.0 {
+        // Silence the audio before the fade begins
+        afade_parts.push(format!(
+            "volume=enable='between(t,0,{end:.6})':volume=0",
+            end = audio_fade_start,
+        ));
+    }
+    afade_parts.push(format!(
+        "afade=t=in:st={st:.6}:d={d:.6}",
+        st = audio_fade_start,
+        d = fadein,
+    ));
+
+    // Video & audio fade-out
+    let total = fade.total_duration_secs;
+    let fadeout_start = (total - fadeout).max(0.0);
+    vfade_parts.push(format!(
+        "fade=t=out:st={st:.6}:d={d:.6}",
+        st = fadeout_start,
+        d = fadeout,
+    ));
+    afade_parts.push(format!(
+        "afade=t=out:st={st:.6}:d={d:.6}",
+        st = fadeout_start,
+        d = fadeout,
+    ));
+
+    let next_v = if has_title {
+        "vfaded".to_owned()
+    } else {
+        "v".to_owned()
+    };
+    parts.push(format!(
+        "[{input}]{filters}[{output}]",
+        input = current_v,
+        filters = vfade_parts.join(","),
+        output = next_v,
+    ));
+    current_v = next_v;
+
+    parts.push(format!(
+        "[{input}]{filters}[a]",
+        input = current_a,
+        filters = afade_parts.join(","),
+    ));
+
+    // ── Stage 4: Title drawtext ───────────────────────────────────────────
+
+    if let Some(title_text) = fade.title {
+        let lines: Vec<&str> = title_text.split('/').collect();
+        let line_count = lines.len() as i32;
+        let font_size = 48;
+        let line_spacing = 16;
+        let total_text_height = line_count * font_size + (line_count - 1) * line_spacing;
+
+        let mut drawtext_chain: Vec<String> = Vec::new();
+
+        for (li, line) in lines.iter().enumerate() {
+            let li = li as i32;
+            let y_offset = -(total_text_height / 2) + li * (font_size + line_spacing);
+
+            let escaped = escape_drawtext(line.trim());
+
+            // Alpha expression: full opacity during [0, hold], linear fade 1→0 during [hold, hold+fadein]
+            // After hold+fadein, alpha=0 (title gone). If hold=0, title immediately starts fading.
+            let alpha_expr = if hold > 0.0 {
+                format!(
+                    "if(lt(t\\,{hold:.6})\\,1\\,max(0\\,1-(t-{hold:.6})/{fadein:.6}))",
+                    hold = hold,
+                    fadein = fadein,
+                )
+            } else {
+                format!("max(0\\,1-t/{fadein:.6})", fadein = fadein,)
+            };
+
+            drawtext_chain.push(format!(
+                "drawtext=text='{text}':\
+                 x=(w-tw)/2:y=(h/2)+{y_off}-(th/2):\
+                 fontsize={fs}:fontcolor=white:\
+                 alpha='{alpha}'",
+                text = escaped,
+                y_off = y_offset,
+                fs = font_size,
+                alpha = alpha_expr,
+            ));
+        }
+
+        parts.push(format!(
+            "[{input}]{filters}[v]",
+            input = current_v,
+            filters = drawtext_chain.join(","),
+        ));
     }
 
     parts.join(";")
 }
 
+/// Escape text for ffmpeg's drawtext filter.
+///
+/// Characters that have special meaning in ffmpeg filter expressions
+/// need to be escaped with a backslash.
+fn escape_drawtext(text: &str) -> String {
+    text.replace('\\', "\\\\\\\\")
+        .replace('\'', "'\\\\\\''")
+        .replace(':', "\\:")
+        .replace('%', "\\%")
+}
+
 // ── Command construction ──────────────────────────────────────────────────────
 
-/// Build the ffmpeg `Command` for a two-input concat.
+/// Build the ffmpeg `Command` for a two-input concat with always-on
+/// fade-in/fade-out and optional title overlay.
+///
+/// Only two inputs are used: 0=pre (trimmed to cut point), 1=post (full).
+/// The black-hold and fade effects are achieved purely through filters —
+/// the pre-video is never seeked or further trimmed.
 ///
 /// This is shared by both the real encode path and `--dry-run`, so the
 /// printed command always matches what would actually be executed.
 pub fn build_ffmpeg_command(params: &ConcatParams) -> Command {
-    let filter_complex = build_filter_complex(params.blurs);
+    let fade = FadeParams {
+        fadein: params.fadein,
+        fadeout: params.fadeout,
+        black_hold: params.black_hold,
+        title: params.title,
+        total_duration_secs: params.estimated_total_secs,
+    };
+
+    let filter_complex = build_filter_complex(params.blurs, &fade);
 
     let mut cmd = Command::new(params.ffmpeg);
     cmd.args(["-hide_banner", "-y"]);
@@ -359,12 +552,35 @@ mod tests {
     use super::*;
     use crate::cli::BlurRegion;
 
+    /// Default fade params (fadein=1, fadeout=1, no hold, no title).
+    fn default_fade() -> FadeParams<'static> {
+        FadeParams {
+            total_duration_secs: 60.0,
+            ..Default::default()
+        }
+    }
+
     // ── Filter graph construction ─────────────────────────────────────────
 
     #[test]
-    fn filter_no_blur() {
-        let filter = build_filter_complex(&[]);
-        assert_eq!(filter, "[0:v][0:a][1:v][1:a]concat=n=2:v=1:a=1[v][a]");
+    fn filter_no_blur_default_fades() {
+        let filter = build_filter_complex(&[], &default_fade());
+
+        // Always 2-input concat
+        assert!(filter.contains("[0:v][0:a][1:v][1:a]concat=n=2:v=1:a=1"));
+        // Video fade-in at st=0 (no hold), d=1
+        assert!(filter.contains("fade=t=in:st=0.000000:d=1.000000"));
+        // Video fade-out at st=59
+        assert!(filter.contains("fade=t=out:st=59.000000:d=1.000000"));
+        // Audio fade-in from st=0 (no hold, so no volume silence)
+        assert!(filter.contains("afade=t=in:st=0.000000:d=1.000000"));
+        // Audio fade-out
+        assert!(filter.contains("afade=t=out:st=59.000000:d=1.000000"));
+        // No volume silence (hold=0, hold-fadein < 0)
+        assert!(!filter.contains("volume="));
+        // Final labels
+        assert!(filter.contains("[v]"));
+        assert!(filter.contains("[a]"));
     }
 
     #[test]
@@ -375,10 +591,10 @@ mod tests {
             width: 480,
             height: 200,
         }];
-        let filter = build_filter_complex(&blurs);
+        let filter = build_filter_complex(&blurs, &default_fade());
 
-        // Must start with the concat producing [cv0][a]
-        assert!(filter.contains("concat=n=2:v=1:a=1[cv0][a]"));
+        // Must start with the concat producing [cv0][araw]
+        assert!(filter.contains("concat=n=2:v=1:a=1[cv0][araw]"));
         // Must have a split from [cv0]
         assert!(filter.contains("[cv0]split[main0][blur0]"));
         // Must crop with correct dimensions
@@ -387,8 +603,12 @@ mod tests {
         assert!(filter.contains(&format!("boxblur={}", BLUR_LUMA_RADIUS)));
         // Must overlay at correct position
         assert!(filter.contains("overlay=0:840"));
-        // Final label must be [v]
-        assert!(filter.ends_with("[v]"));
+        // Fade filters present after blur
+        assert!(filter.contains("fade=t=in"));
+        assert!(filter.contains("fade=t=out"));
+        // Final labels
+        assert!(filter.contains("[v]"));
+        assert!(filter.contains("[a]"));
     }
 
     #[test]
@@ -407,15 +627,17 @@ mod tests {
                 height: 60,
             },
         ];
-        let filter = build_filter_complex(&blurs);
+        let filter = build_filter_complex(&blurs, &default_fade());
 
         // First blur: input=[cv0], output=[cv1]
         assert!(filter.contains("[cv0]split[main0][blur0]"));
         assert!(filter.contains("[cv1]"));
 
-        // Second blur: input=[cv1], final output=[v]
+        // Second blur: input=[cv1], output=[cv2]
         assert!(filter.contains("[cv1]split[main1][blur1]"));
-        assert!(filter.ends_with("[v]"));
+        // Fade applied after blur chain
+        assert!(filter.contains("fade=t=in"));
+        assert!(filter.contains("[v]"));
     }
 
     #[test]
@@ -428,13 +650,179 @@ mod tests {
                 height: 50,
             })
             .collect();
-        let filter = build_filter_complex(&blurs);
+        let filter = build_filter_complex(&blurs, &default_fade());
 
         // Intermediate labels cv1, cv2 must appear
         assert!(filter.contains("cv1"));
         assert!(filter.contains("cv2"));
         // Final output is [v]
-        assert!(filter.ends_with("[v]"));
+        assert!(filter.contains("[v]"));
+    }
+
+    // ── Fade filter construction ──────────────────────────────────────────
+
+    #[test]
+    fn filter_custom_fadein() {
+        let fade = FadeParams {
+            fadein: 2.5,
+            total_duration_secs: 60.0,
+            ..Default::default()
+        };
+        let filter = build_filter_complex(&[], &fade);
+
+        // Always 2-input concat (no lavfi inputs)
+        assert!(filter.contains("concat=n=2"));
+        assert!(!filter.contains("concat=n=3"));
+        // Video fade-in at st=0 (no hold), d=2.5
+        assert!(filter.contains("fade=t=in:st=0.000000:d=2.500000"));
+        // Audio fade-in from st=0, d=2.5
+        assert!(filter.contains("afade=t=in:st=0.000000:d=2.500000"));
+        // No volume silence (hold-fadein < 0)
+        assert!(!filter.contains("volume="));
+    }
+
+    #[test]
+    fn filter_custom_fadeout() {
+        let fade = FadeParams {
+            fadeout: 2.0,
+            total_duration_secs: 60.0,
+            ..Default::default()
+        };
+        let filter = build_filter_complex(&[], &fade);
+
+        // Video fade-out starting at 58s
+        assert!(filter.contains("fade=t=out:st=58.000000:d=2.000000"));
+        // Audio fade-out
+        assert!(filter.contains("afade=t=out:st=58.000000:d=2.000000"));
+    }
+
+    #[test]
+    fn filter_with_black_hold() {
+        let fade = FadeParams {
+            fadein: 2.0,
+            fadeout: 1.0,
+            black_hold: 10.0,
+            total_duration_secs: 60.0,
+            ..Default::default()
+        };
+        let filter = build_filter_complex(&[], &fade);
+
+        // 2-input concat (no lavfi)
+        assert!(filter.contains("concat=n=2"));
+        assert!(!filter.contains("concat=n=3"));
+        // Video fade-in starts at hold=10
+        assert!(filter.contains("fade=t=in:st=10.000000:d=2.000000"));
+        // Audio: silence [0, hold-fadein=8], then afade from 8 for 2s
+        assert!(filter.contains("volume=enable='between(t,0,8.000000)':volume=0"));
+        assert!(filter.contains("afade=t=in:st=8.000000:d=2.000000"));
+    }
+
+    #[test]
+    fn filter_black_hold_less_than_fadein() {
+        // hold=0.5, fadein=2.0 → hold-fadein=-1.5 → clamped to 0
+        let fade = FadeParams {
+            fadein: 2.0,
+            fadeout: 1.0,
+            black_hold: 0.5,
+            total_duration_secs: 60.0,
+            ..Default::default()
+        };
+        let filter = build_filter_complex(&[], &fade);
+
+        // Video fade-in starts at hold=0.5
+        assert!(filter.contains("fade=t=in:st=0.500000:d=2.000000"));
+        // Audio: no silence period (hold-fadein < 0), afade from st=0
+        assert!(!filter.contains("volume="));
+        assert!(filter.contains("afade=t=in:st=0.000000:d=2.000000"));
+    }
+
+    #[test]
+    fn filter_fadein_fadeout_and_title() {
+        let fade = FadeParams {
+            fadein: 1.0,
+            fadeout: 1.0,
+            black_hold: 2.0,
+            title: Some("Boss Name/Mythic Kill"),
+            total_duration_secs: 63.0,
+        };
+        let filter = build_filter_complex(&[], &fade);
+
+        // 2-input concat
+        assert!(filter.contains("concat=n=2"));
+        // Video fade-in starts at hold=2
+        assert!(filter.contains("fade=t=in:st=2.000000:d=1.000000"));
+        // Video fade-out
+        assert!(filter.contains("fade=t=out:st=62.000000:d=1.000000"));
+        // Audio silence [0, hold-fadein=1]
+        assert!(filter.contains("volume=enable='between(t,0,1.000000)':volume=0"));
+        // Audio fade-in from st=1
+        assert!(filter.contains("afade=t=in:st=1.000000:d=1.000000"));
+        // Title drawtext with two lines
+        assert!(filter.contains("drawtext=text='Boss Name'"));
+        assert!(filter.contains("drawtext=text='Mythic Kill'"));
+        // Title uses alpha expression (not enable/between)
+        assert!(
+            filter.contains("alpha='if(lt(t\\,2.000000)\\,1\\,max(0\\,1-(t-2.000000)/1.000000))'")
+        );
+    }
+
+    #[test]
+    fn filter_title_no_hold() {
+        let fade = FadeParams {
+            fadein: 1.0,
+            fadeout: 1.0,
+            black_hold: 0.0,
+            title: Some("My Title"),
+            total_duration_secs: 60.0,
+        };
+        let filter = build_filter_complex(&[], &fade);
+
+        // Title uses simplified alpha expression (no hold)
+        assert!(filter.contains("alpha='max(0\\,1-t/1.000000)'"));
+    }
+
+    #[test]
+    fn filter_fadein_and_blur() {
+        let blurs = vec![BlurRegion {
+            x: 0,
+            y: 840,
+            width: 480,
+            height: 200,
+        }];
+        let fade = FadeParams {
+            fadein: 1.0,
+            fadeout: 1.0,
+            black_hold: 0.0,
+            total_duration_secs: 61.0,
+            title: None,
+        };
+        let filter = build_filter_complex(&blurs, &fade);
+
+        // 2-input concat
+        assert!(filter.contains("concat=n=2"));
+        // Blur chain
+        assert!(filter.contains("split[main0][blur0]"));
+        assert!(filter.contains("crop=480:200:0:840"));
+        // Fade filters after blur
+        assert!(filter.contains("fade=t=in"));
+        // Final labels
+        assert!(filter.contains("[v]"));
+        assert!(filter.contains("[a]"));
+    }
+
+    #[test]
+    fn filter_title_escapes_special_chars() {
+        let fade = FadeParams {
+            fadein: 1.0,
+            fadeout: 1.0,
+            black_hold: 0.0,
+            title: Some("Hello: World"),
+            total_duration_secs: 61.0,
+        };
+        let filter = build_filter_complex(&[], &fade);
+
+        // Colon should be escaped
+        assert!(filter.contains("Hello\\: World"));
     }
 
     // ── parse_out_time_ms ─────────────────────────────────────────────────
@@ -536,5 +924,79 @@ mod tests {
     #[should_panic(expected = "blur preview requires at least one region")]
     fn preview_filter_empty_blurs_panics() {
         build_blur_preview_filter(&[]);
+    }
+
+    // ── Drawtext escape ───────────────────────────────────────────────────
+
+    #[test]
+    fn escape_drawtext_colons() {
+        assert_eq!(escape_drawtext("Hello: World"), "Hello\\: World");
+    }
+
+    #[test]
+    fn escape_drawtext_percent() {
+        assert_eq!(escape_drawtext("100%"), "100\\%");
+    }
+
+    #[test]
+    fn escape_drawtext_plain() {
+        assert_eq!(escape_drawtext("Hello World"), "Hello World");
+    }
+
+    // ── build_ffmpeg_command ───────────────────────────────────────────────
+
+    /// Helper to build a ConcatParams for command construction tests.
+    fn test_concat_params(cut_point_secs: f64, encoder: &EncoderConfig) -> ConcatParams<'_> {
+        ConcatParams {
+            ffmpeg: std::path::Path::new("/usr/bin/ffmpeg"),
+            pre: std::path::Path::new("pre.mkv"),
+            post: std::path::Path::new("post.mkv"),
+            output: std::path::Path::new("out.mp4"),
+            cut_point_secs,
+            estimated_total_secs: cut_point_secs + 300.0,
+            encoder,
+            blurs: &[],
+            fadein: 1.0,
+            fadeout: 1.0,
+            black_hold: 0.0,
+            title: None,
+        }
+    }
+
+    #[test]
+    fn cmd_basic_two_inputs() {
+        let enc = EncoderConfig::from_name("libx264");
+        let params = test_concat_params(25.0, &enc);
+        let cmd = build_ffmpeg_command(&params);
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+
+        // No -ss (pre-video is never seeked)
+        assert!(!args.contains(&"-ss".to_owned()));
+        // -t trims the pre-video to cut point
+        assert!(args.contains(&"-t".to_owned()));
+        let t_pos = args.iter().position(|a| a == "-t").unwrap();
+        assert_eq!(args[t_pos + 1], "25.000000");
+    }
+
+    #[test]
+    fn cmd_black_hold_does_not_seek() {
+        let enc = EncoderConfig::from_name("libx264");
+        let mut params = test_concat_params(25.0, &enc);
+        params.black_hold = 10.0;
+        params.fadein = 2.0;
+        let cmd = build_ffmpeg_command(&params);
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+
+        // Still no -ss — black_hold is handled purely by the filter graph
+        assert!(!args.contains(&"-ss".to_owned()));
+        // -t is still the full cut point
+        let t_pos = args.iter().position(|a| a == "-t").unwrap();
+        assert_eq!(args[t_pos + 1], "25.000000");
     }
 }

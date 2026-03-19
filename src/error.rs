@@ -24,6 +24,20 @@ pub enum LimitcutError {
     #[error("--preview-blur requires at least one --blur region")]
     PreviewBlurWithoutRegions,
 
+    #[error(
+        "--black-hold ({hold:.1}s) exceeds the pre-video cut point ({cut:.1}s). \
+         Use a shorter --black-hold value."
+    )]
+    BlackHoldExceedsCutPoint { hold: f64, cut: f64 },
+
+    #[error("Failed to probe video resolution from {path}: {stderr}")]
+    #[allow(dead_code)]
+    ResolutionProbeFailed { path: PathBuf, stderr: String },
+
+    #[error("Failed to parse video resolution from ffprobe output '{raw}'")]
+    #[allow(dead_code)]
+    ResolutionParseFailed { raw: String },
+
     // ── FFmpeg / FFprobe ──────────────────────────────────────────────────
     #[error("ffmpeg not found in PATH. Install ffmpeg to use limitcut.")]
     FfmpegNotFound,

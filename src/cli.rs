@@ -21,7 +21,7 @@ use crate::error::{LimitcutError, Result};
     author,
     about,
     long_about = None,
-    after_help = "EXAMPLES:\n  limitcut prepull.mkv pull.mkv\n  limitcut prepull.mkv pull.mkv -o combined.mp4\n  limitcut prepull.mkv pull.mkv --blur 0:840:480:200 --blur 1400:0:480:60\n  limitcut prepull.mkv pull.mkv --blur 0:840:480:200 --preview-blur\n  limitcut prepull.mkv pull.mkv --encoder libx264 --dry-run"
+    after_help = "EXAMPLES:\n  limitcut prepull.mkv pull.mkv\n  limitcut prepull.mkv pull.mkv -o combined.mp4\n  limitcut prepull.mkv pull.mkv --blur 0:840:480:200 --blur 1400:0:480:60\n  limitcut prepull.mkv pull.mkv --blur 0:840:480:200 --preview-blur\n  limitcut prepull.mkv pull.mkv --encoder libx264 --dry-run\n  limitcut prepull.mkv pull.mkv --fadein 1.5 --fadeout 2.0\n  limitcut prepull.mkv pull.mkv --black-hold 10 --fadein 2 --title \"Boss Name/Mythic Kill\""
 )]
 pub struct Args {
     /// The first recording (will be trimmed at the detected cut point).
@@ -81,6 +81,57 @@ pub struct Args {
     /// Print the ffmpeg command that would be executed, then exit without running it.
     #[arg(long, default_value_t = false)]
     pub dry_run: bool,
+
+    /// Duration of the fade-in from black at the start (in seconds).
+    ///
+    /// A fade-in is always applied. Use this flag to override the default
+    /// duration of 1.0s. The first frames of the pre-video are blacked out
+    /// and silenced, then video and audio smoothly fade in.
+    ///
+    /// Combine with --black-hold to keep the screen black for longer before
+    /// the fade begins, and --title to overlay centred text.
+    ///
+    /// Examples:
+    ///   --fadein 2.5                    (2.5s fade instead of default 1.0s)
+    #[arg(long, value_name = "SECONDS", num_args = 0..=1, default_missing_value = "1.0")]
+    pub fadein: Option<f64>,
+
+    /// Duration of the fade-out to black at the end (in seconds).
+    ///
+    /// A fade-out is always applied. Use this flag to override the default
+    /// duration of 1.0s.
+    ///
+    /// Examples:
+    ///   --fadeout 1.5                   (1.5s fade instead of default 1.0s)
+    #[arg(long, value_name = "SECONDS", num_args = 0..=1, default_missing_value = "1.0")]
+    pub fadeout: Option<f64>,
+
+    /// Seconds of black screen before the fade-in begins.
+    ///
+    /// The first N seconds of the pre-video are blacked out (video and audio),
+    /// then the fade-in reveals the actual footage. The pre-video itself is
+    /// NOT trimmed — all footage up to the cut point is preserved.
+    ///
+    /// Combine with --title to show centred text during the black period.
+    /// Errors if the value exceeds the pre-video cut point.
+    ///
+    /// Examples:
+    ///   --black-hold 5                  (5s black, then 1s default fadein)
+    ///   --black-hold 5 --fadein 2       (5s black, then 2s fadein)
+    #[arg(long, value_name = "SECONDS")]
+    pub black_hold: Option<f64>,
+
+    /// Centred title text displayed during the black-hold and fade-in period.
+    ///
+    /// The title is shown at full opacity during the black-hold period, then
+    /// fades out in sync with the video fade-in. Use '/' to separate multiple
+    /// lines.
+    ///
+    /// Examples:
+    ///   --title "My Video"
+    ///   --title "Boss Name/Mythic Kill"
+    #[arg(long, value_name = "TEXT")]
+    pub title: Option<String>,
 
     /// Enable verbose debug logging.
     #[arg(short, long, default_value_t = false)]
@@ -436,5 +487,84 @@ mod tests {
     fn default_preview_relative_path() {
         let p = default_preview_path(std::path::Path::new("prepull.mkv"));
         assert_eq!(p, PathBuf::from("prepull_blur_preview.jpg"));
+    }
+
+    // ── Fade / title CLI flags ────────────────────────────────────────────
+
+    #[test]
+    fn cli_fadein_flag_only() {
+        let args = Args::try_parse_from(["limitcut", "pre.mkv", "post.mkv", "--fadein"]).unwrap();
+        assert_eq!(args.fadein, Some(1.0));
+    }
+
+    #[test]
+    fn cli_fadein_with_value() {
+        let args =
+            Args::try_parse_from(["limitcut", "pre.mkv", "post.mkv", "--fadein", "2.5"]).unwrap();
+        assert_eq!(args.fadein, Some(2.5));
+    }
+
+    #[test]
+    fn cli_fadeout_flag_only() {
+        let args = Args::try_parse_from(["limitcut", "pre.mkv", "post.mkv", "--fadeout"]).unwrap();
+        assert_eq!(args.fadeout, Some(1.0));
+    }
+
+    #[test]
+    fn cli_fadeout_with_value() {
+        let args =
+            Args::try_parse_from(["limitcut", "pre.mkv", "post.mkv", "--fadeout", "1.5"]).unwrap();
+        assert_eq!(args.fadeout, Some(1.5));
+    }
+
+    #[test]
+    fn cli_black_hold_with_value() {
+        let args = Args::try_parse_from(["limitcut", "pre.mkv", "post.mkv", "--black-hold", "3.5"])
+            .unwrap();
+        assert_eq!(args.black_hold, Some(3.5));
+    }
+
+    #[test]
+    fn cli_title() {
+        let args = Args::try_parse_from([
+            "limitcut",
+            "pre.mkv",
+            "post.mkv",
+            "--title",
+            "Boss Name/Mythic Kill",
+        ])
+        .unwrap();
+        assert_eq!(args.title, Some("Boss Name/Mythic Kill".to_owned()));
+    }
+
+    #[test]
+    fn cli_all_fade_flags() {
+        let args = Args::try_parse_from([
+            "limitcut",
+            "pre.mkv",
+            "post.mkv",
+            "--fadein",
+            "1.5",
+            "--fadeout",
+            "2.0",
+            "--black-hold",
+            "3.0",
+            "--title",
+            "Hello/World",
+        ])
+        .unwrap();
+        assert_eq!(args.fadein, Some(1.5));
+        assert_eq!(args.fadeout, Some(2.0));
+        assert_eq!(args.black_hold, Some(3.0));
+        assert_eq!(args.title, Some("Hello/World".to_owned()));
+    }
+
+    #[test]
+    fn cli_fadein_not_set() {
+        let args = Args::try_parse_from(["limitcut", "pre.mkv", "post.mkv"]).unwrap();
+        assert!(args.fadein.is_none());
+        assert!(args.fadeout.is_none());
+        assert!(args.black_hold.is_none());
+        assert!(args.title.is_none());
     }
 }

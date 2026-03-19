@@ -159,7 +159,21 @@ fn run(args: Args) -> anyhow::Result<()> {
 
     // ── 5. Build and run the ffmpeg concat command ────────────────────────
 
-    // Total output duration ≈ cut_point + full post-video length (for progress bar)
+    // Resolve fade parameters (always applied, defaults to 1.0s)
+    let fadein = args.fadein.unwrap_or(1.0);
+    let fadeout = args.fadeout.unwrap_or(1.0);
+    let black_hold = args.black_hold.unwrap_or(0.0);
+
+    // Validate: black_hold must fit within the pre-video (cut point)
+    if black_hold > result.cut_point_secs {
+        return Err(LimitcutError::BlackHoldExceedsCutPoint {
+            hold: black_hold,
+            cut: result.cut_point_secs,
+        }
+        .into());
+    }
+
+    // Total output duration ≈ pre cut point + full post-video length
     let post_duration = get_duration(&bins.ffprobe, &args.post_video).unwrap_or(0.0);
     let estimated_total = result.cut_point_secs + post_duration;
 
@@ -178,6 +192,10 @@ fn run(args: Args) -> anyhow::Result<()> {
         estimated_total_secs: estimated_total,
         encoder: &encoder,
         blurs: &args.blur,
+        fadein,
+        fadeout,
+        black_hold,
+        title: args.title.as_deref(),
     };
 
     if args.dry_run {
@@ -214,7 +232,8 @@ fn exit_code(err: &anyhow::Error) -> i32 {
         | LimitcutError::InputNotAFile(_)
         | LimitcutError::OutputExists(_)
         | LimitcutError::InvalidBlurRegion { .. }
-        | LimitcutError::PreviewBlurWithoutRegions,
+        | LimitcutError::PreviewBlurWithoutRegions
+        | LimitcutError::BlackHoldExceedsCutPoint { .. },
     ) = err.downcast_ref::<LimitcutError>()
     {
         1
