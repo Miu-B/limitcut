@@ -1,6 +1,6 @@
 [package]
 name = "limitcut"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "Seamlessly combine two overlapping video recordings into one MP4 using ffmpeg"
 license = "MIT"
