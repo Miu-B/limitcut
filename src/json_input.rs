@@ -137,7 +137,11 @@ pub fn derive_output_path(json: &ValidatedJson, base_dir: &Path) -> PathBuf {
     let encounter_dir = normalize_encounter_name(&json.encounter);
     let file_name = format!("{}.mp4", json.started_at.format("%H-%M-%S"));
     if let Some(ref job) = json.job {
-        base_dir.join(date_dir).join(encounter_dir).join(job).join(file_name)
+        base_dir
+            .join(date_dir)
+            .join(encounter_dir)
+            .join(job)
+            .join(file_name)
     } else {
         base_dir.join(date_dir).join(encounter_dir).join(file_name)
     }

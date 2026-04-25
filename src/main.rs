@@ -58,10 +58,13 @@ fn main() {
 
 fn run(args: Args) -> anyhow::Result<()> {
     if !matches!(
-        (&args.pre_video, &args.post_video, &args.json, &args.json_dir),
-        (Some(_), Some(_), None, None)
-            | (None, None, Some(_), None)
-            | (None, None, None, Some(_))
+        (
+            &args.pre_video,
+            &args.post_video,
+            &args.json,
+            &args.json_dir
+        ),
+        (Some(_), Some(_), None, None) | (None, None, Some(_), None) | (None, None, None, Some(_))
     ) {
         return Err(LimitcutError::InvalidInputMode(
             "provide either PRE_VIDEO POST_VIDEO, or --json, or --json-dir",
@@ -85,7 +88,9 @@ fn run(args: Args) -> anyhow::Result<()> {
             let title = args.title.as_deref();
             run_single(pre, post, &output, title, &args, &config, &bins)
         }
-        (None, None, Some(json_path), None) => run_from_json(json_path, &args, &config, &bins, false),
+        (None, None, Some(json_path), None) => {
+            run_from_json(json_path, &args, &config, &bins, false)
+        }
         (None, None, None, Some(json_dir)) => run_from_json_dir(json_dir, &args, &config, &bins),
         _ => Err(LimitcutError::InvalidInputMode(
             "provide either PRE_VIDEO POST_VIDEO, or --json, or --json-dir",
