@@ -57,6 +57,18 @@ fn main() {
 }
 
 fn run(args: Args) -> anyhow::Result<()> {
+    if !matches!(
+        (&args.pre_video, &args.post_video, &args.json, &args.json_dir),
+        (Some(_), Some(_), None, None)
+            | (None, None, Some(_), None)
+            | (None, None, None, Some(_))
+    ) {
+        return Err(LimitcutError::InvalidInputMode(
+            "provide either PRE_VIDEO POST_VIDEO, or --json, or --json-dir",
+        )
+        .into());
+    }
+
     let config = Config::load()?;
     let bins = FfmpegBinaries::locate()?;
     tracing::debug!("ffmpeg:  {}", bins.ffmpeg.display());
