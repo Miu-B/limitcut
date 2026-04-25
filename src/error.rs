@@ -9,6 +9,13 @@ use thiserror::Error;
 #[derive(Debug, Error)]
 pub enum LimitcutError {
     // ── Input validation ──────────────────────────────────────────────────
+    #[error("Failed to parse config file {path}: {source}")]
+    ConfigParseError {
+        path: PathBuf,
+        #[source]
+        source: toml::de::Error,
+    },
+
     #[error("Input file not found: {0}")]
     InputNotFound(PathBuf),
 
@@ -17,6 +24,12 @@ pub enum LimitcutError {
 
     #[error("Output path already exists (use --overwrite to replace): {0}")]
     OutputExists(PathBuf),
+
+    #[error("Output directory path is not a directory: {0}")]
+    OutputDirNotADirectory(PathBuf),
+
+    #[error("Conflicting or invalid input arguments: {0}")]
+    InvalidInputMode(&'static str),
 
     #[error("Invalid blur region '{input}': expected x:y:w:h with non-negative integers")]
     InvalidBlurRegion { input: String },
@@ -29,6 +42,46 @@ pub enum LimitcutError {
          Use a shorter --black-hold value."
     )]
     BlackHoldExceedsCutPoint { hold: f64, cut: f64 },
+
+    #[error("JSON file not found: {0}")]
+    JsonNotFound(PathBuf),
+
+    #[error("JSON path is not a file: {0}")]
+    JsonNotAFile(PathBuf),
+
+    #[error("JSON directory not found: {0}")]
+    JsonDirNotFound(PathBuf),
+
+    #[error("JSON path is not a directory: {0}")]
+    JsonDirNotADir(PathBuf),
+
+    #[error("No JSON files found in directory: {0}")]
+    NoJsonFilesFound(PathBuf),
+
+    #[error("Failed to read JSON directory {path}: {source}")]
+    JsonDirReadFailed {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+
+    #[error("Failed to parse JSON file {path}: {message}")]
+    JsonParseFailed { path: PathBuf, message: String },
+
+    #[error("Missing required JSON field '{field}' in {path}")]
+    JsonMissingField { path: PathBuf, field: &'static str },
+
+    #[error("JSON field '{field}' in {path} must not be empty")]
+    JsonEmptyField { path: PathBuf, field: &'static str },
+
+    #[error("Invalid started_at datetime '{value}' in {path}; expected RFC 3339 timestamp")]
+    JsonInvalidDatetime { path: PathBuf, value: String },
+
+    #[error("Referenced video from {json} not found: {video}")]
+    JsonVideoNotFound { json: PathBuf, video: PathBuf },
+
+    #[error("Encounter name in {path} normalizes to an empty directory name")]
+    JsonEncounterNameEmpty { path: PathBuf },
 
     #[error("Failed to probe video resolution from {path}: {stderr}")]
     #[allow(dead_code)]

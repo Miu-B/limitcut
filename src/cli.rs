@@ -1,7 +1,9 @@
 use std::path::PathBuf;
 use std::str::FromStr;
 
-use clap::Parser;
+use clap::{ArgGroup, Parser};
+
+use serde::Deserialize;
 
 use crate::error::{LimitcutError, Result};
 
@@ -21,27 +23,67 @@ use crate::error::{LimitcutError, Result};
     author,
     about,
     long_about = None,
-    after_help = "EXAMPLES:\n  limitcut prepull.mkv pull.mkv\n  limitcut prepull.mkv pull.mkv -o combined.mp4\n  limitcut prepull.mkv pull.mkv --blur 0:840:480:200 --blur 1400:0:480:60\n  limitcut prepull.mkv pull.mkv --blur 0:840:480:200 --preview-blur\n  limitcut prepull.mkv pull.mkv --encoder libx264 --dry-run\n  limitcut prepull.mkv pull.mkv --fadein 1.5 --fadeout 2.0\n  limitcut prepull.mkv pull.mkv --black-hold 10 --fadein 2 --title \"Boss Name/Mythic Kill\""
+    after_help = "EXAMPLES:\n  limitcut prepull.mkv pull.mkv\n  limitcut prepull.mkv pull.mkv -o combined.mp4\n  limitcut prepull.mkv pull.mkv --output-dir ~/Recordings/FFXIV\n  limitcut prepull.mkv pull.mkv --blur 0:840:480:200 --blur 1400:0:480:60\n  limitcut prepull.mkv pull.mkv --blur 0:840:480:200 --preview-blur\n  limitcut prepull.mkv pull.mkv --encoder libx264 --dry-run\n  limitcut prepull.mkv pull.mkv --fadein 1.5 --fadeout 2.0\n  limitcut prepull.mkv pull.mkv --black-hold 10 --fadein 2 --title \"Boss Name/Mythic Kill\"\n  limitcut --json 2026-04-24_07-55-31.json --output-dir ~/Recordings/FFXIV\n  limitcut --json-dir ~/Videos/OBS --output-dir ~/Recordings/FFXIV",
+    group(
+        ArgGroup::new("input_mode")
+            .args(["pre_video", "json", "json_dir"])
+            .required(true)
+            .multiple(false)
+    )
 )]
 pub struct Args {
     /// The first recording (will be trimmed at the detected cut point).
     ///
     /// This is the shorter clip that contains footage *before* the main event
     /// starts — e.g. a replay buffer clip saved just before a boss pull.
-    pub pre_video: PathBuf,
+    #[arg(requires = "post_video")]
+    pub pre_video: Option<PathBuf>,
 
     /// The second recording (appended in full after the cut point).
     ///
     /// This is the main recording that starts slightly before the cut point
     /// and continues through the entire event.
-    pub post_video: PathBuf,
+    #[arg(requires = "pre_video")]
+    pub post_video: Option<PathBuf>,
+
+    /// Process a single PullToOBS JSON metadata file.
+    ///
+    /// The referenced `recording` and `replay_buffer` files are resolved
+    /// relative to the JSON file's directory.
+    #[arg(long, value_name = "FILE")]
+    pub json: Option<PathBuf>,
+
+    /// Process all `*.json` PullToOBS metadata files in a directory.
+    ///
+    /// Each JSON file is validated before processing. Invalid files are
+    /// reported and skipped; valid files continue.
+    ///
+    /// When used with `--output-dir`, output is organised as
+    /// `<dir>/YYYY-MM-DD/<encounter>/<job>/HH-MM-SS.mp4`.
+    /// Titles are auto-generated as `"<encounter>/<job> POV"` —
+    /// use `--title` to append additional lines.
+    #[arg(long, value_name = "DIR")]
+    pub json_dir: Option<PathBuf>,
 
     /// Output file path.
     ///
     /// Defaults to the pre-video filename with `_combined.mp4` appended in
     /// the same directory as the pre-video.
-    #[arg(short, long, value_name = "FILE")]
+    #[arg(
+        short,
+        long,
+        value_name = "FILE",
+        conflicts_with_all = ["json", "json_dir", "output_dir"]
+    )]
     pub output: Option<PathBuf>,
+
+    /// Base output directory.
+    ///
+    /// In normal mode, the output filename is auto-generated from the
+    /// pre-video (e.g. `prepull_combined.mp4`). In JSON mode, output is
+    /// organised as `<dir>/YYYY-MM-DD/<encounter>/<job>/HH-MM-SS.mp4`.
+    #[arg(long, value_name = "DIR", conflicts_with = "output")]
+    pub output_dir: Option<PathBuf>,
 
     /// Overwrite the output file if it already exists.
     #[arg(long, default_value_t = false)]
@@ -127,6 +169,9 @@ pub struct Args {
     /// fades out in sync with the video fade-in. Use '/' to separate multiple
     /// lines.
     ///
+    /// In `--json-dir` mode, `"<encounter>/<job> POV"` is automatically
+    /// prepended — `--title` lines are appended after it.
+    ///
     /// Examples:
     ///   --title "My Video"
     ///   --title "Boss Name/Mythic Kill"
@@ -139,7 +184,7 @@ pub struct Args {
 }
 
 /// A rectangular region of the video to blur.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct BlurRegion {
     pub x: u32,
     pub y: u32,
@@ -196,12 +241,19 @@ fn parse_encoder_name(s: &str) -> std::result::Result<String, String> {
 /// Derive the default output path from the pre-video path.
 ///
 /// Strips the extension and appends `_combined.mp4` in the same directory.
-pub fn default_output_path(pre_video: &std::path::Path) -> PathBuf {
+pub fn default_output_filename(pre_video: &std::path::Path) -> String {
     let stem = pre_video
         .file_stem()
         .unwrap_or_else(|| std::ffi::OsStr::new("output"))
         .to_string_lossy();
-    let filename = format!("{}_combined.mp4", stem);
+    format!("{}_combined.mp4", stem)
+}
+
+/// Derive the default output path from the pre-video path.
+///
+/// Strips the extension and appends `_combined.mp4` in the same directory.
+pub fn default_output_path(pre_video: &std::path::Path) -> PathBuf {
+    let filename = default_output_filename(pre_video);
     match pre_video.parent() {
         Some(parent) if parent != std::path::Path::new("") => parent.join(filename),
         _ => PathBuf::from(filename),
@@ -333,6 +385,12 @@ mod tests {
     }
 
     #[test]
+    fn default_output_filename_only() {
+        let filename = default_output_filename(std::path::Path::new("/recordings/prepull.mkv"));
+        assert_eq!(filename, "prepull_combined.mp4");
+    }
+
+    #[test]
     fn default_output_no_extension() {
         let p = default_output_path(std::path::Path::new("/recordings/myvideo"));
         assert_eq!(p, PathBuf::from("/recordings/myvideo_combined.mp4"));
@@ -349,9 +407,12 @@ mod tests {
     #[test]
     fn cli_minimal_args() {
         let args = Args::try_parse_from(["limitcut", "pre.mkv", "post.mkv"]).unwrap();
-        assert_eq!(args.pre_video, PathBuf::from("pre.mkv"));
-        assert_eq!(args.post_video, PathBuf::from("post.mkv"));
+        assert_eq!(args.pre_video, Some(PathBuf::from("pre.mkv")));
+        assert_eq!(args.post_video, Some(PathBuf::from("post.mkv")));
+        assert!(args.json.is_none());
+        assert!(args.json_dir.is_none());
         assert!(args.output.is_none());
+        assert!(args.output_dir.is_none());
         assert!(args.blur.is_empty());
         assert!(!args.dry_run);
         assert!(!args.verbose);
@@ -362,6 +423,35 @@ mod tests {
         let args =
             Args::try_parse_from(["limitcut", "pre.mkv", "post.mkv", "-o", "out.mp4"]).unwrap();
         assert_eq!(args.output, Some(PathBuf::from("out.mp4")));
+    }
+
+    #[test]
+    fn cli_with_output_dir() {
+        let args = Args::try_parse_from([
+            "limitcut",
+            "pre.mkv",
+            "post.mkv",
+            "--output-dir",
+            "/tmp/out",
+        ])
+        .unwrap();
+        assert_eq!(args.output_dir, Some(PathBuf::from("/tmp/out")));
+    }
+
+    #[test]
+    fn cli_json_single() {
+        let args = Args::try_parse_from(["limitcut", "--json", "pull.json"]).unwrap();
+        assert_eq!(args.json, Some(PathBuf::from("pull.json")));
+        assert!(args.pre_video.is_none());
+        assert!(args.post_video.is_none());
+    }
+
+    #[test]
+    fn cli_json_dir() {
+        let args = Args::try_parse_from(["limitcut", "--json-dir", "meta"]).unwrap();
+        assert_eq!(args.json_dir, Some(PathBuf::from("meta")));
+        assert!(args.pre_video.is_none());
+        assert!(args.post_video.is_none());
     }
 
     #[test]
@@ -416,6 +506,40 @@ mod tests {
     #[test]
     fn cli_missing_args_fails() {
         let result = Args::try_parse_from(["limitcut"]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn cli_output_conflicts_with_output_dir() {
+        let result = Args::try_parse_from([
+            "limitcut",
+            "pre.mkv",
+            "post.mkv",
+            "-o",
+            "out.mp4",
+            "--output-dir",
+            "outdir",
+        ]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn cli_output_conflicts_with_json() {
+        let result = Args::try_parse_from(["limitcut", "--json", "pull.json", "-o", "out.mp4"]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn cli_json_conflicts_with_positional_inputs() {
+        let result =
+            Args::try_parse_from(["limitcut", "pre.mkv", "post.mkv", "--json", "pull.json"]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn cli_json_and_json_dir_conflict() {
+        let result =
+            Args::try_parse_from(["limitcut", "--json", "pull.json", "--json-dir", "meta"]);
         assert!(result.is_err());
     }
 
