@@ -23,7 +23,7 @@ use crate::error::{LimitcutError, Result};
     author,
     about,
     long_about = None,
-    after_help = "EXAMPLES:\n  limitcut prepull.mkv pull.mkv\n  limitcut prepull.mkv pull.mkv -o combined.mp4\n  limitcut prepull.mkv pull.mkv --output-dir ~/Recordings/FFXIV\n  limitcut prepull.mkv pull.mkv --blur 0:840:480:200 --blur 1400:0:480:60\n  limitcut prepull.mkv pull.mkv --blur 0:840:480:200 --preview-blur\n  limitcut prepull.mkv pull.mkv --encoder libx264 --dry-run\n  limitcut prepull.mkv pull.mkv --fadein 1.5 --fadeout 2.0\n  limitcut prepull.mkv pull.mkv --black-hold 10 --fadein 2 --title \"Boss Name/Mythic Kill\"\n  limitcut --json 2026-04-24_07-55-31.json --output-dir ~/Recordings/FFXIV\n  limitcut --json-dir ~/Videos/OBS --output-dir ~/Recordings/FFXIV",
+    after_help = "EXAMPLES:\n  limitcut prepull.mkv pull.mkv\n  limitcut prepull.mkv pull.mkv -o combined.mp4\n  limitcut prepull.mkv pull.mkv --output-dir ~/Recordings/FFXIV\n  limitcut prepull.mkv pull.mkv --blur 0:840:480:200 --blur 1400:0:480:60\n  limitcut prepull.mkv pull.mkv --blur 0:840:480:200 --preview-blur\n  limitcut prepull.mkv --blur 0:840:480:200 --preview-blur 5.0\n  limitcut --json 2026-04-25_23-46-39.json --blur 0:840:480:200 --preview-blur\n  limitcut prepull.mkv pull.mkv --encoder libx264 --dry-run\n  limitcut prepull.mkv pull.mkv --fadein 1.5 --fadeout 2.0\n  limitcut prepull.mkv pull.mkv --black-hold 10 --fadein 2 --title \"Boss Name/Mythic Kill\"\n  limitcut --json 2026-04-24_07-55-31.json --output-dir ~/Recordings/FFXIV\n  limitcut --json-dir ~/Videos/OBS --output-dir ~/Recordings/FFXIV",
     group(
         ArgGroup::new("input_mode")
             .args(["pre_video", "json", "json_dir"])
@@ -36,14 +36,18 @@ pub struct Args {
     ///
     /// This is the shorter clip that contains footage *before* the main event
     /// starts — e.g. a replay buffer clip saved just before a boss pull.
-    #[arg(requires = "post_video")]
+    ///
+    /// When --preview-blur is used, only this video is needed; --post_video
+    /// can be omitted.
     pub pre_video: Option<PathBuf>,
 
     /// The second recording (appended in full after the cut point).
     ///
     /// This is the main recording that starts slightly before the cut point
     /// and continues through the entire event.
-    #[arg(requires = "pre_video")]
+    ///
+    /// Optional when --preview-blur is used (only the pre-video is needed for
+    /// blur positioning).
     pub post_video: Option<PathBuf>,
 
     /// Process a single PullToOBS JSON metadata file.
@@ -111,13 +115,19 @@ pub struct Args {
     /// Generate a single JPEG frame with blur regions applied, then exit.
     ///
     /// Accepts an optional timestamp in seconds to seek to (default: 1.0s).
-    /// The preview is saved as `<pre_video>_blur_preview.jpg` alongside the
-    /// input file. Requires at least one --blur region.
+    /// The preview is saved as `<stem>_blur_preview.jpg` in the same directory
+    /// as the pre-video. Requires at least one --blur region.
+    ///
+    /// This only needs the pre-video (the replay buffer / shorter clip).
+    /// The post-video is optional when --preview-blur is used. You can also
+    /// pass --json to pull the pre-video path from a PullToOBS metadata file.
+    /// --json-dir is not supported with --preview-blur.
     ///
     /// Examples:
-    ///   --preview-blur                  (grab frame at 1.0s)
-    ///   --preview-blur 12.5             (grab frame at 12.5s)
-    #[arg(long, value_name = "SECONDS", num_args = 0..=1, default_missing_value = "1.0")]
+    ///   --preview-blur                              (frame at 1.0s)
+    ///   --preview-blur 12.5                         (frame at 12.5s)
+    ///   --preview-blur 5.0                          (frame at 5.0s)
+    #[arg(long, value_name = "SECONDS", num_args = 0..=1, default_missing_value = "1.0", conflicts_with = "json_dir")]
     pub preview_blur: Option<f64>,
 
     /// Print the ffmpeg command that would be executed, then exit without running it.
@@ -559,6 +569,37 @@ mod tests {
     // ── Preview blur CLI ──────────────────────────────────────────────────
 
     #[test]
+    fn cli_preview_blur_single_video() {
+        let args = Args::try_parse_from([
+            "limitcut",
+            "pre.mkv",
+            "--blur",
+            "0:0:100:100",
+            "--preview-blur",
+        ])
+        .unwrap();
+        assert_eq!(args.pre_video, Some(PathBuf::from("pre.mkv")));
+        assert!(args.post_video.is_none());
+        assert_eq!(args.preview_blur, Some(1.0));
+    }
+
+    #[test]
+    fn cli_preview_blur_single_video_with_timestamp() {
+        let args = Args::try_parse_from([
+            "limitcut",
+            "pre.mkv",
+            "--blur",
+            "0:0:100:100",
+            "--preview-blur",
+            "12.5",
+        ])
+        .unwrap();
+        assert_eq!(args.pre_video, Some(PathBuf::from("pre.mkv")));
+        assert!(args.post_video.is_none());
+        assert_eq!(args.preview_blur, Some(12.5));
+    }
+
+    #[test]
     fn cli_preview_blur_flag_only() {
         let args = Args::try_parse_from([
             "limitcut",
@@ -591,6 +632,34 @@ mod tests {
     fn cli_preview_blur_not_set() {
         let args = Args::try_parse_from(["limitcut", "pre.mkv", "post.mkv"]).unwrap();
         assert!(args.preview_blur.is_none());
+    }
+
+    #[test]
+    fn cli_preview_blur_with_json_ok() {
+        let args = Args::try_parse_from([
+            "limitcut",
+            "--json",
+            "pull.json",
+            "--blur",
+            "0:0:100:100",
+            "--preview-blur",
+        ])
+        .unwrap();
+        assert_eq!(args.preview_blur, Some(1.0));
+        assert_eq!(args.json, Some(PathBuf::from("pull.json")));
+    }
+
+    #[test]
+    fn cli_preview_blur_conflicts_with_json_dir() {
+        let result = Args::try_parse_from([
+            "limitcut",
+            "--json-dir",
+            "meta/",
+            "--blur",
+            "0:0:100:100",
+            "--preview-blur",
+        ]);
+        assert!(result.is_err());
     }
 
     // ── Default preview path ──────────────────────────────────────────────

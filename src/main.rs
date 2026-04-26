@@ -57,7 +57,7 @@ fn main() {
 }
 
 fn run(args: Args) -> anyhow::Result<()> {
-    if !matches!(
+    let valid = matches!(
         (
             &args.pre_video,
             &args.post_video,
@@ -65,9 +65,15 @@ fn run(args: Args) -> anyhow::Result<()> {
             &args.json_dir
         ),
         (Some(_), Some(_), None, None) | (None, None, Some(_), None) | (None, None, None, Some(_))
-    ) {
+    ) || (args.pre_video.is_some()
+        && args.post_video.is_none()
+        && args.json.is_none()
+        && args.json_dir.is_none()
+        && args.preview_blur.is_some());
+
+    if !valid {
         return Err(LimitcutError::InvalidInputMode(
-            "provide either PRE_VIDEO POST_VIDEO, or --json, or --json-dir",
+            "provide PRE_VIDEO and POST_VIDEO (or use --preview-blur with just PRE_VIDEO), or --json, or --json-dir",
         )
         .into());
     }
@@ -83,6 +89,24 @@ fn run(args: Args) -> anyhow::Result<()> {
         &args.json,
         &args.json_dir,
     ) {
+        (Some(pre), None, None, None) => {
+            if let Some(timestamp) = args.preview_blur {
+                validate_video_input(pre)?;
+                let blurs = resolve_blurs(&args, &config);
+                if blurs.is_empty() {
+                    return Err(LimitcutError::PreviewBlurWithoutRegions.into());
+                }
+                let preview_path = default_preview_path(pre);
+                generate_blur_preview(&bins.ffmpeg, pre, &blurs, timestamp, &preview_path)?;
+                println!("Blur preview saved: {}", preview_path.display());
+                Ok(())
+            } else {
+                Err(LimitcutError::InvalidInputMode(
+                    "provide PRE_VIDEO and POST_VIDEO (or use --preview-blur with just PRE_VIDEO), or --json, or --json-dir",
+                )
+                .into())
+            }
+        }
         (Some(pre), Some(post), None, None) => {
             let output = resolve_normal_output_path(&args, &config, pre);
             let title = args.title.as_deref();
@@ -562,6 +586,67 @@ mod tests {
 
         let err = run(args).unwrap_err();
         assert!(matches!(
+            err.downcast_ref::<LimitcutError>(),
+            Some(LimitcutError::InvalidInputMode(_))
+        ));
+    }
+
+    #[test]
+    fn run_rejects_single_video_without_preview_blur() {
+        let args = Args {
+            pre_video: Some(PathBuf::from("pre.mkv")),
+            post_video: None,
+            json: None,
+            json_dir: None,
+            output: None,
+            output_dir: None,
+            overwrite: false,
+            encoder: None,
+            blur: vec![],
+            preview_blur: None,
+            dry_run: false,
+            fadein: None,
+            fadeout: None,
+            black_hold: None,
+            title: None,
+            verbose: false,
+        };
+
+        let err = run(args).unwrap_err();
+        assert!(matches!(
+            err.downcast_ref::<LimitcutError>(),
+            Some(LimitcutError::InvalidInputMode(_))
+        ));
+    }
+
+    #[test]
+    fn run_preview_blur_single_video_enters_preview_path() {
+        let args = Args {
+            pre_video: Some(PathBuf::from("pre.mkv")),
+            post_video: None,
+            json: None,
+            json_dir: None,
+            output: None,
+            output_dir: None,
+            overwrite: false,
+            encoder: None,
+            blur: vec![BlurRegion {
+                x: 0,
+                y: 0,
+                width: 100,
+                height: 100,
+            }],
+            preview_blur: Some(1.0),
+            dry_run: false,
+            fadein: None,
+            fadeout: None,
+            black_hold: None,
+            title: None,
+            verbose: false,
+        };
+
+        let err = run(args).unwrap_err();
+        assert!(!matches!(
             err.downcast_ref::<LimitcutError>(),
             Some(LimitcutError::InvalidInputMode(_))
         ));
