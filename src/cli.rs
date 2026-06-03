@@ -23,10 +23,10 @@ use crate::error::{LimitcutError, Result};
     author,
     about,
     long_about = None,
-    after_help = "EXAMPLES:\n  limitcut prepull.mkv pull.mkv\n  limitcut prepull.mkv pull.mkv -o combined.mp4\n  limitcut prepull.mkv pull.mkv --output-dir ~/Recordings/FFXIV\n  limitcut prepull.mkv pull.mkv --blur 0:840:480:200 --blur 1400:0:480:60\n  limitcut prepull.mkv pull.mkv --blur 0:840:480:200 --preview-blur\n  limitcut prepull.mkv --blur 0:840:480:200 --preview-blur 5.0\n  limitcut --json 2026-04-25_23-46-39.json --blur 0:840:480:200 --preview-blur\n  limitcut prepull.mkv pull.mkv --encoder libx264 --dry-run\n  limitcut prepull.mkv pull.mkv --fadein 1.5 --fadeout 2.0\n  limitcut prepull.mkv pull.mkv --black-hold 10 --fadein 2 --title \"Boss Name/Mythic Kill\"\n  limitcut --json 2026-04-24_07-55-31.json --output-dir ~/Recordings/FFXIV\n  limitcut --json-dir ~/Videos/OBS --output-dir ~/Recordings/FFXIV",
+    after_help = "EXAMPLES:\n  limitcut prepull.mkv pull.mkv\n  limitcut prepull.mkv pull.mkv -o combined.mp4\n  limitcut prepull.mkv pull.mkv --output-dir ~/Recordings/FFXIV\n  limitcut prepull.mkv pull.mkv --blur 0:840:480:200 --blur 1400:0:480:60\n  limitcut prepull.mkv pull.mkv --blur 0:840:480:200 --preview-blur\n  limitcut prepull.mkv --blur 0:840:480:200 --preview-blur 5.0\n  limitcut --json 2026-04-25_23-46-39.json --blur 0:840:480:200 --preview-blur\n  limitcut --instapost ~/Videos/OBS/instapost_20260602_190702.json\n  limitcut --watch-instapost ~/Videos/OBS --output-dir ~/Recordings/FFXIV\n  limitcut prepull.mkv pull.mkv --encoder libx264 --dry-run\n  limitcut prepull.mkv pull.mkv --fadein 1.5 --fadeout 2.0\n  limitcut prepull.mkv pull.mkv --black-hold 10 --fadein 2 --title \"Boss Name/Mythic Kill\"\n  limitcut --json 2026-04-24_07-55-31.json --output-dir ~/Recordings/FFXIV\n  limitcut --json-dir ~/Videos/OBS --output-dir ~/Recordings/FFXIV",
     group(
         ArgGroup::new("input_mode")
-            .args(["pre_video", "json", "json_dir"])
+            .args(["pre_video", "json", "json_dir", "instapost", "watch_instapost"])
             .required(true)
             .multiple(false)
     )
@@ -69,6 +69,22 @@ pub struct Args {
     #[arg(long, value_name = "DIR")]
     pub json_dir: Option<PathBuf>,
 
+    /// Process a single InstaPost JSON descriptor.
+    ///
+    /// The referenced `replay_buffer` clip is resolved relative to the JSON
+    /// file's directory and processed as a single input, without overlap
+    /// detection or a second recording file.
+    #[arg(long, value_name = "FILE")]
+    pub instapost: Option<PathBuf>,
+
+    /// Watch a directory for `instapost_*.json` descriptors.
+    ///
+    /// Existing backlog files are processed on startup, then new matching JSON
+    /// files are handled one at a time. Successful JSON descriptors are moved
+    /// into `done/`; failures are moved into `failed/`.
+    #[arg(long, value_name = "DIR")]
+    pub watch_instapost: Option<PathBuf>,
+
     /// Output file path.
     ///
     /// Defaults to the pre-video filename with `_combined.mp4` appended in
@@ -77,7 +93,7 @@ pub struct Args {
         short,
         long,
         value_name = "FILE",
-        conflicts_with_all = ["json", "json_dir", "output_dir"]
+        conflicts_with_all = ["json", "json_dir", "watch_instapost", "output_dir"]
     )]
     pub output: Option<PathBuf>,
 
@@ -120,14 +136,14 @@ pub struct Args {
     ///
     /// This only needs the pre-video (the replay buffer / shorter clip).
     /// The post-video is optional when --preview-blur is used. You can also
-    /// pass --json to pull the pre-video path from a PullToOBS metadata file.
-    /// --json-dir is not supported with --preview-blur.
+    /// pass --json or --instapost to pull the input path from metadata.
+    /// --json-dir and --watch-instapost are not supported with --preview-blur.
     ///
     /// Examples:
     ///   --preview-blur                              (frame at 1.0s)
     ///   --preview-blur 12.5                         (frame at 12.5s)
     ///   --preview-blur 5.0                          (frame at 5.0s)
-    #[arg(long, value_name = "SECONDS", num_args = 0..=1, default_missing_value = "1.0", conflicts_with = "json_dir")]
+    #[arg(long, value_name = "SECONDS", num_args = 0..=1, default_missing_value = "1.0", conflicts_with_all = ["json_dir", "watch_instapost"])]
     pub preview_blur: Option<f64>,
 
     /// Print the ffmpeg command that would be executed, then exit without running it.
@@ -136,12 +152,14 @@ pub struct Args {
 
     /// Duration of the fade-in from black at the start (in seconds).
     ///
-    /// A fade-in is always applied. Use this flag to override the default
-    /// duration of 1.0s. The first frames of the pre-video are blacked out
-    /// and silenced, then video and audio smoothly fade in.
+    /// A fade-in is always applied in the normal two-video and PullToOBS JSON
+    /// concat flows. Use this flag to override the default duration of 1.0s.
+    /// The first frames of the pre-video are blacked out and silenced, then
+    /// video and audio smoothly fade in.
     ///
     /// Combine with --black-hold to keep the screen black for longer before
     /// the fade begins, and --title to overlay centred text.
+    /// Ignored in InstaPost mode, which applies blur only.
     ///
     /// Examples:
     ///   --fadein 2.5                    (2.5s fade instead of default 1.0s)
@@ -150,8 +168,9 @@ pub struct Args {
 
     /// Duration of the fade-out to black at the end (in seconds).
     ///
-    /// A fade-out is always applied. Use this flag to override the default
-    /// duration of 1.0s.
+    /// A fade-out is always applied in the normal two-video and PullToOBS JSON
+    /// concat flows. Use this flag to override the default duration of 1.0s.
+    /// Ignored in InstaPost mode, which applies blur only.
     ///
     /// Examples:
     ///   --fadeout 1.5                   (1.5s fade instead of default 1.0s)
@@ -160,12 +179,14 @@ pub struct Args {
 
     /// Seconds of black screen before the fade-in begins.
     ///
-    /// The first N seconds of the pre-video are blacked out (video and audio),
-    /// then the fade-in reveals the actual footage. The pre-video itself is
-    /// NOT trimmed — all footage up to the cut point is preserved.
+    /// In the normal two-video and PullToOBS JSON concat flows, the first N
+    /// seconds of the pre-video are blacked out (video and audio), then the
+    /// fade-in reveals the actual footage. The pre-video itself is NOT trimmed
+    /// — all footage up to the cut point is preserved.
     ///
     /// Combine with --title to show centred text during the black period.
     /// Errors if the value exceeds the pre-video cut point.
+    /// Ignored in InstaPost mode, which applies blur only.
     ///
     /// Examples:
     ///   --black-hold 5                  (5s black, then 1s default fadein)
@@ -179,8 +200,9 @@ pub struct Args {
     /// fades out in sync with the video fade-in. Use '/' to separate multiple
     /// lines.
     ///
-    /// In `--json-dir` mode, `"<encounter>/<job> POV"` is automatically
-    /// prepended — `--title` lines are appended after it.
+    /// In `--json-dir` mode, an automatic title is prepended — `--title`
+    /// lines are appended after it. Ignored in InstaPost mode, which applies
+    /// blur only and does not render title overlays.
     ///
     /// Examples:
     ///   --title "My Video"
@@ -421,6 +443,8 @@ mod tests {
         assert_eq!(args.post_video, Some(PathBuf::from("post.mkv")));
         assert!(args.json.is_none());
         assert!(args.json_dir.is_none());
+        assert!(args.instapost.is_none());
+        assert!(args.watch_instapost.is_none());
         assert!(args.output.is_none());
         assert!(args.output_dir.is_none());
         assert!(args.blur.is_empty());
@@ -460,6 +484,30 @@ mod tests {
     fn cli_json_dir() {
         let args = Args::try_parse_from(["limitcut", "--json-dir", "meta"]).unwrap();
         assert_eq!(args.json_dir, Some(PathBuf::from("meta")));
+        assert!(args.pre_video.is_none());
+        assert!(args.post_video.is_none());
+    }
+
+    #[test]
+    fn cli_instapost_single() {
+        let args = Args::try_parse_from([
+            "limitcut",
+            "--instapost",
+            "instapost_20260602_190702.json",
+        ])
+        .unwrap();
+        assert_eq!(
+            args.instapost,
+            Some(PathBuf::from("instapost_20260602_190702.json"))
+        );
+        assert!(args.pre_video.is_none());
+        assert!(args.post_video.is_none());
+    }
+
+    #[test]
+    fn cli_watch_instapost() {
+        let args = Args::try_parse_from(["limitcut", "--watch-instapost", "meta"]).unwrap();
+        assert_eq!(args.watch_instapost, Some(PathBuf::from("meta")));
         assert!(args.pre_video.is_none());
         assert!(args.post_video.is_none());
     }
@@ -650,10 +698,38 @@ mod tests {
     }
 
     #[test]
+    fn cli_preview_blur_with_instapost_ok() {
+        let args = Args::try_parse_from([
+            "limitcut",
+            "--instapost",
+            "instapost.json",
+            "--blur",
+            "0:0:100:100",
+            "--preview-blur",
+        ])
+        .unwrap();
+        assert_eq!(args.preview_blur, Some(1.0));
+        assert_eq!(args.instapost, Some(PathBuf::from("instapost.json")));
+    }
+
+    #[test]
     fn cli_preview_blur_conflicts_with_json_dir() {
         let result = Args::try_parse_from([
             "limitcut",
             "--json-dir",
+            "meta/",
+            "--blur",
+            "0:0:100:100",
+            "--preview-blur",
+        ]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn cli_preview_blur_conflicts_with_watch_instapost() {
+        let result = Args::try_parse_from([
+            "limitcut",
+            "--watch-instapost",
             "meta/",
             "--blur",
             "0:0:100:100",

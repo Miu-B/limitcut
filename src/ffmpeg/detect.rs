@@ -55,6 +55,48 @@ impl EncoderConfig {
         }
     }
 
+    pub fn discord_720p() -> Self {
+        Self {
+            name: SW_ENCODER.to_owned(),
+            display_name: "libx264 (Discord 720p profile)".to_owned(),
+            quality_args: vec![
+                "-crf".to_owned(),
+                "30".to_owned(),
+                "-preset".to_owned(),
+                "medium".to_owned(),
+                "-maxrate".to_owned(),
+                "2200k".to_owned(),
+                "-bufsize".to_owned(),
+                "4400k".to_owned(),
+                "-pix_fmt".to_owned(),
+                "yuv420p".to_owned(),
+                "-movflags".to_owned(),
+                "+faststart".to_owned(),
+            ],
+        }
+    }
+
+    pub fn discord_1080p() -> Self {
+        Self {
+            name: SW_ENCODER.to_owned(),
+            display_name: "libx264 (Discord 1080p profile)".to_owned(),
+            quality_args: vec![
+                "-crf".to_owned(),
+                "30".to_owned(),
+                "-preset".to_owned(),
+                "medium".to_owned(),
+                "-maxrate".to_owned(),
+                "2600k".to_owned(),
+                "-bufsize".to_owned(),
+                "5200k".to_owned(),
+                "-pix_fmt".to_owned(),
+                "yuv420p".to_owned(),
+                "-movflags".to_owned(),
+                "+faststart".to_owned(),
+            ],
+        }
+    }
+
     pub fn nvenc() -> Self {
         Self {
             name: "h264_nvenc".to_owned(),
@@ -146,6 +188,26 @@ mod tests {
         assert_eq!(enc.name, "h264_nvenc");
         assert!(enc.quality_args.contains(&"-cq".to_owned()));
         assert!(enc.quality_args.contains(&"18".to_owned()));
+    }
+
+    #[test]
+    fn discord_720p_config() {
+        let enc = EncoderConfig::discord_720p();
+        assert_eq!(enc.name, "libx264");
+        assert!(enc.quality_args.contains(&"-crf".to_owned()));
+        assert!(enc.quality_args.contains(&"30".to_owned()));
+        assert!(enc.quality_args.contains(&"-maxrate".to_owned()));
+        assert!(enc.quality_args.contains(&"2200k".to_owned()));
+    }
+
+    #[test]
+    fn discord_1080p_config() {
+        let enc = EncoderConfig::discord_1080p();
+        assert_eq!(enc.name, "libx264");
+        assert!(enc.quality_args.contains(&"-crf".to_owned()));
+        assert!(enc.quality_args.contains(&"30".to_owned()));
+        assert!(enc.quality_args.contains(&"-maxrate".to_owned()));
+        assert!(enc.quality_args.contains(&"2600k".to_owned()));
     }
 
     #[test]

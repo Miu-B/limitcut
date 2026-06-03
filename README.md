@@ -34,6 +34,16 @@ overlapping recordings with shared audio will work just fine.
   job, encounter title, and output filename. In `--json-dir` mode, the title
   overlay is auto-generated as `"<encounter>/<job> POV"` with optional
   user-provided lines appended.
+- **InstaPost support** — process single-file `instapost_*.json` descriptors,
+  resolve the replay buffer clip relative to the JSON file, transcode it to
+  MP4, and archive it under a deterministic `instapost/YYYY-MM-DD/...` layout.
+- **InstaPost watch mode** — monitor an OBS directory, process existing backlog
+  on startup, ignore `*.tmp`, and move processed descriptors into `done/` or
+  `failed/`.
+- **Optional Discord webhook upload** — after InstaPost processing succeeds,
+  upload the MP4 to a Discord webhook configured in `~/.config/limitcut/config.toml`.
+  InstaPost can encode directly as **720p** or **1080p**, and the produced file is
+  the one that gets uploaded.
 - **Dry-run mode** — `--dry-run` prints the exact ffmpeg command without
   running it.
 - **Progress bar** — shows real-time encoding progress.
@@ -79,6 +89,13 @@ PullToOBS JSON mode:
 ```text
 limitcut --json <FILE> [OPTIONS]
 limitcut --json-dir <DIR> [OPTIONS]
+```
+
+InstaPost mode:
+
+```text
+limitcut --instapost <FILE> [OPTIONS]
+limitcut --watch-instapost <DIR> [OPTIONS]
 ```
 
 ### Examples
@@ -143,13 +160,29 @@ Process all PullToOBS JSON files in a directory:
 limitcut --json-dir ~/Videos/OBS --output-dir ~/Recordings/FFXIV
 ```
 
-In `--json-dir` mode, the title overlay is auto-generated as
-`"<encounter>/<job> POV"`. Use `--title` to append additional lines.
+Process a single InstaPost descriptor:
 
-> **Note:** The PullToOBS JSON metadata output is available from
-> [PullToOBS](https://github.com/Miu-B/PullToOBS) v0.3.1.0 onward.
-> Older versions do not produce JSON files — limitcut's `--json` / `--json-dir`
-> modes won't apply.
+```bash
+limitcut --instapost ~/Videos/OBS/instapost_20260602_190702.json --output-dir ~/Recordings/FFXIV
+```
+
+Watch an OBS directory for InstaPost backlog and new arrivals:
+
+```bash
+limitcut --watch-instapost ~/Videos/OBS --output-dir ~/Recordings/FFXIV
+```
+
+In `--json-dir` mode, the title overlay is auto-generated as
+`"<encounter>/<job> POV"`. InstaPost uses the same encounter/territory label
+for archive paths and Discord post text, but does not render title overlays,
+so `--title` does not apply there.
+
+> **Note:** The standard PullToOBS encounter JSON metadata output is available
+> from [PullToOBS](https://github.com/Miu-B/PullToOBS) v0.3.1.0 onward.
+> The InstaPost / Quick Save descriptor flow used by `--instapost` and
+> `--watch-instapost` is available from PullToOBS v0.4.0.0 onward.
+> Older versions do not produce these JSON files, so the corresponding
+> limitcut modes won't apply.
 
 ### Options
 
@@ -159,18 +192,33 @@ In `--json-dir` mode, the title overlay is auto-generated as
 | `--output-dir <DIR>` | Base output directory. In JSON mode, output is organised as `<dir>/YYYY-MM-DD/<encounter>/<job>/HH-MM-SS.mp4` |
 | `--json <FILE>` | Process a single PullToOBS metadata JSON file |
 | `--json-dir <DIR>` | Process all `*.json` PullToOBS metadata files in a directory |
+| `--instapost <FILE>` | Process a single InstaPost JSON descriptor |
+| `--watch-instapost <DIR>` | Watch a directory for `instapost_*.json` descriptors |
 | `--overwrite` | Overwrite the output file if it exists |
-| `--encoder <ENCODER>` | H.264 encoder: `nvenc`, `vaapi`, `videotoolbox`, `libx264` |
+| `--encoder <ENCODER>` | H.264 encoder: `nvenc`, `vaapi`, `videotoolbox`, `libx264` (ignored in InstaPost mode, which uses a Discord-oriented profile) |
 | `--blur <x:y:w:h>` | Blur a rectangular region (repeatable) |
 | `--preview-blur [SECS]` | Render a single frame with blur regions applied (default: 1.0s) |
 | `--dry-run` | Print the ffmpeg command and exit |
-| `--fadein [SECS]` | Fade-in duration from black at the start (default: 1.0s) |
-| `--fadeout [SECS]` | Fade-out duration to black at the end (default: 1.0s) |
-| `--black-hold <SECONDS>` | Seconds of black screen before the fade-in begins |
-| `--title <TEXT>` | Centred title text during black-hold/fade-in. Use `/` for line breaks. In `--json-dir` mode, `"<encounter>/<job> POV"` is auto-prepended |
+| `--fadein [SECS]` | Fade-in duration from black at the start (default: 1.0s; ignored in InstaPost mode) |
+| `--fadeout [SECS]` | Fade-out duration to black at the end (default: 1.0s; ignored in InstaPost mode) |
+| `--black-hold <SECONDS>` | Seconds of black screen before the fade-in begins (ignored in InstaPost mode) |
+| `--title <TEXT>` | Centred title text during black-hold/fade-in. Use `/` for line breaks. In `--json-dir` mode, `"<encounter>/<job> POV"` is auto-prepended. Ignored in InstaPost mode |
 | `-v, --verbose` | Enable debug logging |
 | `-h, --help` | Show help |
 | `-V, --version` | Show version |
+
+Discord upload / InstaPost output config keys:
+
+```toml
+discord_enabled = true
+discord_webhook_url = "https://discord.com/api/webhooks/..."
+# Optional: "720p" (default) or "1080p"
+# discord_video_mode = "720p"
+```
+
+InstaPost uses a Discord-oriented H.264 encode profile directly, so `720p`
+and `1080p` choose both the output resolution and the compression profile used
+for the saved MP4 and the uploaded file.
 
 ### Exit codes
 
@@ -189,6 +237,23 @@ In `--json-dir` mode, the title overlay is auto-generated as
    cross-correlation to find the best match.
 4. **Trim** the pre-video at the detected cut point and concatenate it with the
    full post-video using ffmpeg's `concat` filter.
+
+In InstaPost mode, limitcut instead:
+
+1. Validates the dedicated InstaPost JSON schema.
+2. Resolves `replay_buffer` relative to the JSON file.
+3. Processes the single replay-buffer clip directly — no overlap detection and
+   no second `recording` file required.
+4. Applies configured blur regions, but skips fade-in, fade-out, black-hold,
+   and title overlay so short clips are not shortened further.
+5. Encodes directly to the configured Discord video mode (`720p` by default,
+   or `1080p` when configured) using a Discord-oriented compression profile.
+6. Writes the final video as
+   `<dir>/instapost/YYYY-MM-DD/<display_label>/<job>/HH-MM-SS.mp4`.
+7. On successful processing, moves the InstaPost JSON descriptor into `done/`;
+   on failure, into `failed/` (watch mode and normal `--instapost` runs).
+   `--dry-run` and `--preview-blur` leave the descriptor in place.
+8. Optionally uploads that same MP4 to a configured Discord webhook.
 
 In JSON mode, limitcut additionally:
 

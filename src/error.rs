@@ -55,11 +55,24 @@ pub enum LimitcutError {
     #[error("JSON path is not a directory: {0}")]
     JsonDirNotADir(PathBuf),
 
+    #[error("InstaPost watch directory not found: {0}")]
+    InstapostWatchDirNotFound(PathBuf),
+
+    #[error("InstaPost watch path is not a directory: {0}")]
+    InstapostWatchDirNotADir(PathBuf),
+
     #[error("No JSON files found in directory: {0}")]
     NoJsonFilesFound(PathBuf),
 
     #[error("Failed to read JSON directory {path}: {source}")]
     JsonDirReadFailed {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+
+    #[error("Failed to read InstaPost watch directory {path}: {source}")]
+    InstapostWatchDirReadFailed {
         path: PathBuf,
         #[source]
         source: std::io::Error,
@@ -119,6 +132,9 @@ pub enum LimitcutError {
 
     #[error("FFmpeg process could not be spawned: {0}")]
     FfmpegSpawnFailed(#[source] std::io::Error),
+
+    #[error("Discord upload failed for {url}: {message}")]
+    DiscordUploadFailed { url: String, message: String },
 
     // ── Correlation ───────────────────────────────────────────────────────
     #[error(

@@ -6,6 +6,15 @@ use serde::Deserialize;
 use crate::cli::BlurRegion;
 use crate::error::LimitcutError;
 
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+pub enum DiscordVideoMode {
+    #[serde(rename = "1080p")]
+    P1080,
+    #[default]
+    #[serde(rename = "720p")]
+    P720,
+}
+
 /// User configuration loaded from the config file.
 ///
 /// Every field is optional — missing keys simply fall back to the built-in
@@ -29,6 +38,12 @@ pub struct Config {
     /// auto-generated from the pre-video. In JSON mode encounter subfolders are
     /// created under this directory.
     pub output_dir: Option<PathBuf>,
+    /// Optional Discord webhook used for InstaPost uploads.
+    pub discord_webhook_url: Option<String>,
+    /// Enable Discord uploads for InstaPost processing.
+    pub discord_enabled: Option<bool>,
+    /// Discord video mode used for both InstaPost archive output and Discord upload.
+    pub discord_video_mode: Option<DiscordVideoMode>,
     /// Blur regions applied to the output video.
     #[serde(default)]
     pub blur: Vec<BlurRegion>,
@@ -62,6 +77,15 @@ const DEFAULT_CONFIG_TEMPLATE: &str = "\
 # `<dir>/YYYY-MM-DD/<encounter>/<job>/HH-MM-SS.mp4`. If not set, output
 # goes next to the pre-video (normal mode) or next to the JSON file (JSON mode).
 # output_dir = \"/home/user/Videos\"
+
+# Discord webhook used for InstaPost uploads.
+# Uploads only happen when discord_enabled = true as well.
+# Discord video mode controls both the saved InstaPost MP4 and the uploaded file.
+# Supported values: \"1080p\" and \"720p\" (default).
+# limitcut uses a Discord-oriented compression profile for both modes.
+# discord_webhook_url = \"https://discord.com/api/webhooks/...\"
+# discord_enabled = false
+# discord_video_mode = \"720p\"
 
 # Blur regions applied to the output video. Repeat this block for
 # each region. CLI --blur flags replace all config blurs when present.
@@ -166,6 +190,9 @@ mod tests {
         assert!(config.black_hold.is_none());
         assert!(config.overwrite.is_none());
         assert!(config.output_dir.is_none());
+        assert!(config.discord_webhook_url.is_none());
+        assert!(config.discord_enabled.is_none());
+        assert!(config.discord_video_mode.is_none());
         assert!(config.blur.is_empty());
     }
 
@@ -173,6 +200,9 @@ mod tests {
     fn parse_empty_toml() {
         let config: Config = toml::from_str("").unwrap();
         assert!(config.encoder.is_none());
+        assert!(config.discord_webhook_url.is_none());
+        assert!(config.discord_enabled.is_none());
+        assert!(config.discord_video_mode.is_none());
         assert!(config.blur.is_empty());
     }
 
@@ -185,6 +215,9 @@ mod tests {
             black_hold = 3.0
             overwrite = true
             output_dir = "/home/user/Videos"
+            discord_webhook_url = "https://discord.com/api/webhooks/test"
+            discord_enabled = true
+            discord_video_mode = "720p"
 
             [[blur]]
             x = 0
@@ -205,6 +238,12 @@ mod tests {
         assert_eq!(config.black_hold, Some(3.0));
         assert_eq!(config.overwrite, Some(true));
         assert_eq!(config.output_dir, Some(PathBuf::from("/home/user/Videos")));
+        assert_eq!(
+            config.discord_webhook_url,
+            Some("https://discord.com/api/webhooks/test".to_owned())
+        );
+        assert_eq!(config.discord_enabled, Some(true));
+        assert_eq!(config.discord_video_mode, Some(DiscordVideoMode::P720));
         assert_eq!(config.blur.len(), 2);
         assert_eq!(
             config.blur[0],
@@ -237,6 +276,9 @@ mod tests {
         assert_eq!(config.overwrite, Some(true));
         assert!(config.encoder.is_none());
         assert!(config.fadeout.is_none());
+        assert!(config.discord_webhook_url.is_none());
+        assert!(config.discord_enabled.is_none());
+        assert!(config.discord_video_mode.is_none());
         assert!(config.blur.is_empty());
     }
 
@@ -267,6 +309,9 @@ mod tests {
         // The commented-out template must parse as valid TOML (all lines are comments)
         let config: Config = toml::from_str(DEFAULT_CONFIG_TEMPLATE).unwrap();
         assert!(config.encoder.is_none());
+        assert!(config.discord_webhook_url.is_none());
+        assert!(config.discord_enabled.is_none());
+        assert!(config.discord_video_mode.is_none());
         assert!(config.blur.is_empty());
     }
 
@@ -274,6 +319,12 @@ mod tests {
     fn parse_malformed_toml_errors() {
         let result = toml::from_str::<Config>("encoder = [invalid");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn parse_discord_video_mode_1080p() {
+        let config: Config = toml::from_str("discord_video_mode = \"1080p\"").unwrap();
+        assert_eq!(config.discord_video_mode, Some(DiscordVideoMode::P1080));
     }
 
     #[test]

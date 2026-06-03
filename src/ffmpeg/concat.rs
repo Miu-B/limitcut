@@ -44,6 +44,24 @@ pub struct ConcatParams<'a> {
     pub pre_seek_secs: f64,
 }
 
+/// Parameters for single-input processing (InstaPost / replay-buffer flow).
+pub struct SingleInputParams<'a> {
+    pub ffmpeg: &'a Path,
+    pub input: &'a Path,
+    pub output: &'a Path,
+    pub estimated_total_secs: f64,
+    pub encoder: &'a EncoderConfig,
+    pub blurs: &'a [BlurRegion],
+    pub fadein: f64,
+    pub fadeout: f64,
+    pub black_hold: f64,
+    pub title: Option<&'a str>,
+    /// Seconds to seek into the input before reading (0.0 = no seek).
+    pub input_seek_secs: f64,
+    /// Optional output height limit preserving aspect ratio.
+    pub output_height: Option<u32>,
+}
+
 /// Result returned after a successful concat operation.
 #[derive(Debug)]
 pub struct ConcatResult {
@@ -94,35 +112,47 @@ impl Default for FadeParams<'_> {
 ///    and fade-out, plus audio silence/fade filters
 /// 4. Drawtext title overlay (visible during hold, fades out during fade-in)
 pub fn build_filter_complex(blurs: &[BlurRegion], fade: &FadeParams) -> String {
-    let hold = fade.black_hold;
-    let fadein = fade.fadein;
-    let fadeout = fade.fadeout;
-
-    // ── Stage 1: Concat ───────────────────────────────────────────────────
-
-    let has_title = fade.title.is_some();
-    // We always have fade, so we always need post-processing
-    let needs_post_processing = true;
-
-    let (concat_v_label, concat_a_label) = if needs_post_processing {
-        ("cv0".to_owned(), "araw".to_owned())
-    } else {
-        ("v".to_owned(), "a".to_owned())
-    };
+    let concat_v_label = "cv0".to_owned();
+    let concat_a_label = "araw".to_owned();
 
     let mut parts: Vec<String> = Vec::new();
-
-    // Always 2-input concat (no lavfi black source)
     parts.push(format!(
         "[0:v][0:a][1:v][1:a]concat=n=2:v=1:a=1[{concat_v}][{concat_a}]",
         concat_v = concat_v_label,
         concat_a = concat_a_label,
     ));
 
-    // ── Stage 2: Blur regions ─────────────────────────────────────────────
+    append_post_processing(&mut parts, concat_v_label, concat_a_label, blurs, fade);
 
-    let mut current_v = concat_v_label;
+    parts.join(";")
+}
 
+pub fn build_single_input_filter_complex(
+    blurs: &[BlurRegion],
+    fade: &FadeParams,
+    output_height: Option<u32>,
+) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    append_post_processing(&mut parts, "0:v".to_owned(), "0:a".to_owned(), blurs, fade);
+
+    if let Some(height) = output_height {
+        parts.push(format!("[v]scale=-2:min({height}\\,ih)[vscaled]"));
+    }
+
+    parts.join(";")
+}
+
+fn append_post_processing(
+    parts: &mut Vec<String>,
+    mut current_v: String,
+    current_a: String,
+    blurs: &[BlurRegion],
+    fade: &FadeParams,
+) {
+    let hold = fade.black_hold;
+    let fadein = fade.fadein;
+    let fadeout = fade.fadeout;
+    let has_title = fade.title.is_some();
     for (i, blur) in blurs.iter().enumerate() {
         let output_label = format!("cv{}", i + 1);
         let main = format!("main{}", i);
@@ -147,27 +177,17 @@ pub fn build_filter_complex(blurs: &[BlurRegion], fade: &FadeParams) -> String {
         current_v = output_label;
     }
 
-    // ── Stage 3: Video & audio fade ───────────────────────────────────────
-
-    let current_a = concat_a_label;
-
-    // Video fade-in: fade=t=in:st=hold:d=fadein
-    // This automatically blacks out all frames before st=hold.
     let mut vfade_parts: Vec<String> = Vec::new();
     let mut afade_parts: Vec<String> = Vec::new();
 
-    // Video fade-in
     vfade_parts.push(format!(
         "fade=t=in:st={st:.6}:d={d:.6}",
         st = hold,
         d = fadein,
     ));
 
-    // Audio: silence [0, max(0, hold-fadein)], then afade from max(0, hold-fadein) for fadein
-    // so audio reaches full volume at t=hold (just as video starts fading in).
     let audio_fade_start = (hold - fadein).max(0.0);
     if audio_fade_start > 0.0 {
-        // Silence the audio before the fade begins
         afade_parts.push(format!(
             "volume=enable='between(t,0,{end:.6})':volume=0",
             end = audio_fade_start,
@@ -179,7 +199,6 @@ pub fn build_filter_complex(blurs: &[BlurRegion], fade: &FadeParams) -> String {
         d = fadein,
     ));
 
-    // Video & audio fade-out
     let total = fade.total_duration_secs;
     let fadeout_start = (total - fadeout).max(0.0);
     vfade_parts.push(format!(
@@ -212,8 +231,6 @@ pub fn build_filter_complex(blurs: &[BlurRegion], fade: &FadeParams) -> String {
         filters = afade_parts.join(","),
     ));
 
-    // ── Stage 4: Title drawtext ───────────────────────────────────────────
-
     if let Some(title_text) = fade.title {
         let lines: Vec<&str> = title_text.split('/').collect();
         let line_count = lines.len() as i32;
@@ -226,11 +243,8 @@ pub fn build_filter_complex(blurs: &[BlurRegion], fade: &FadeParams) -> String {
         for (li, line) in lines.iter().enumerate() {
             let li = li as i32;
             let y_offset = -(total_text_height / 2) + li * (font_size + line_spacing);
-
             let escaped = escape_drawtext(line.trim());
 
-            // Alpha expression: full opacity during [0, hold], linear fade 1→0 during [hold, hold+fadein]
-            // After hold+fadein, alpha=0 (title gone). If hold=0, title immediately starts fading.
             let alpha_expr = if hold > 0.0 {
                 format!(
                     "if(lt(t\\,{hold:.6})\\,1\\,max(0\\,1-(t-{hold:.6})/{fadein:.6}))",
@@ -259,8 +273,6 @@ pub fn build_filter_complex(blurs: &[BlurRegion], fade: &FadeParams) -> String {
             filters = drawtext_chain.join(","),
         ));
     }
-
-    parts.join(";")
 }
 
 /// Escape text for ffmpeg's drawtext filter.
@@ -300,20 +312,14 @@ pub fn build_ffmpeg_command(params: &ConcatParams) -> Command {
     let mut cmd = Command::new(params.ffmpeg);
     cmd.args(["-hide_banner", "-y"]);
 
-    // Input 0: pre-video, optionally seeked and trimmed to the cut point.
-    // When pre_seek_secs > 0, we seek into the pre-video and shorten -t
-    // so the stream still ends at the original cut point.
     if params.pre_seek_secs > 0.0 {
         cmd.args(["-ss", &format!("{:.6}", params.pre_seek_secs)]);
     }
     let pre_duration = params.cut_point_secs - params.pre_seek_secs;
     cmd.args(["-t", &format!("{:.6}", pre_duration)]);
     cmd.arg("-i").arg(params.pre);
-
-    // Input 1: full post-video
     cmd.arg("-i").arg(params.post);
 
-    // Filter graph
     cmd.args([
         "-filter_complex",
         &filter_complex,
@@ -323,18 +329,58 @@ pub fn build_ffmpeg_command(params: &ConcatParams) -> Command {
         "[a]",
     ]);
 
-    // Video encoder + quality
     cmd.args(["-c:v", &params.encoder.name]);
     for arg in &params.encoder.quality_args {
         cmd.arg(arg);
     }
 
-    // Audio codec
     cmd.args(["-c:a", "aac", "-b:a", "192k"]);
-
-    // Output
     cmd.arg(params.output);
+    cmd
+}
 
+pub fn build_single_input_ffmpeg_command(params: &SingleInputParams) -> Command {
+    let fade = FadeParams {
+        fadein: params.fadein,
+        fadeout: params.fadeout,
+        black_hold: params.black_hold,
+        title: params.title,
+        total_duration_secs: params.estimated_total_secs,
+    };
+
+    let filter_complex =
+        build_single_input_filter_complex(params.blurs, &fade, params.output_height);
+
+    let mut cmd = Command::new(params.ffmpeg);
+    cmd.args(["-hide_banner", "-y"]);
+
+    if params.input_seek_secs > 0.0 {
+        cmd.args(["-ss", &format!("{:.6}", params.input_seek_secs)]);
+    }
+    cmd.arg("-i").arg(params.input);
+
+    let video_map = if params.output_height.is_some() {
+        "[vscaled]"
+    } else {
+        "[v]"
+    };
+
+    cmd.args([
+        "-filter_complex",
+        &filter_complex,
+        "-map",
+        video_map,
+        "-map",
+        "[a]",
+    ]);
+
+    cmd.args(["-c:v", &params.encoder.name]);
+    for arg in &params.encoder.quality_args {
+        cmd.arg(arg);
+    }
+
+    cmd.args(["-c:a", "aac", "-b:a", "192k"]);
+    cmd.arg(params.output);
     cmd
 }
 
@@ -447,6 +493,16 @@ fn run_ffmpeg_with_progress(mut cmd: Command, total_duration_secs: f64) -> Resul
 /// Optionally applies blur regions to the output video.
 pub fn concatenate(params: &ConcatParams) -> Result<ConcatResult> {
     let cmd = build_ffmpeg_command(params);
+
+    let start = Instant::now();
+    run_ffmpeg_with_progress(cmd, params.estimated_total_secs)?;
+    let encode_time = start.elapsed();
+
+    Ok(ConcatResult { encode_time })
+}
+
+pub fn transcode_single(params: &SingleInputParams) -> Result<ConcatResult> {
+    let cmd = build_single_input_ffmpeg_command(params);
 
     let start = Instant::now();
     run_ffmpeg_with_progress(cmd, params.estimated_total_secs)?;
@@ -838,6 +894,26 @@ mod tests {
         assert!(filter.contains("Hello\\: World"));
     }
 
+    #[test]
+    fn single_input_filter_has_no_concat_stage() {
+        let fade = FadeParams {
+            fadein: 1.0,
+            fadeout: 1.0,
+            black_hold: 2.0,
+            title: Some("Solution Nine/RPR POV"),
+            total_duration_secs: 30.0,
+        };
+        let filter = build_single_input_filter_complex(&[], &fade, None);
+
+        assert!(!filter.contains("concat=n=2"));
+        assert!(filter.contains("[0:v]fade=t=in:st=2.000000:d=1.000000"));
+        assert!(filter.contains("[0:a]volume=enable='between(t,0,1.000000)':volume=0"));
+        assert!(filter.contains("drawtext=text='Solution Nine'"));
+        assert!(filter.contains("drawtext=text='RPR POV'"));
+        assert!(filter.contains("[v]"));
+        assert!(filter.contains("[a]"));
+    }
+
     // ── parse_out_time_ms ─────────────────────────────────────────────────
 
     #[test]
@@ -1058,5 +1134,36 @@ mod tests {
         // -t is full cut point
         let t_pos = args.iter().position(|a| a == "-t").unwrap();
         assert_eq!(args[t_pos + 1], "30.000000");
+    }
+
+    #[test]
+    fn single_input_cmd_has_one_input_and_no_trim() {
+        let enc = EncoderConfig::from_name("libx264");
+        let params = SingleInputParams {
+            ffmpeg: std::path::Path::new("/usr/bin/ffmpeg"),
+            input: std::path::Path::new("replay.mkv"),
+            output: std::path::Path::new("out.mp4"),
+            estimated_total_secs: 42.0,
+            encoder: &enc,
+            blurs: &[],
+            fadein: 1.0,
+            fadeout: 1.0,
+            black_hold: 0.0,
+            title: Some("Solution Nine/RPR POV"),
+            input_seek_secs: 0.0,
+            output_height: Some(720),
+        };
+        let cmd = build_single_input_ffmpeg_command(&params);
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+
+        assert!(!args.contains(&"-t".to_owned()));
+        assert_eq!(args.iter().filter(|arg| *arg == "-i").count(), 1);
+        assert!(args.contains(&"replay.mkv".to_owned()));
+        assert!(!args.iter().any(|arg| arg.contains("concat=n=2")));
+        assert!(args.contains(&"[vscaled]".to_owned()));
+        assert!(args.iter().any(|arg| arg.contains("scale=-2:min(720\\,ih)")));
     }
 }
